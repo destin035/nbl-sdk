@@ -1064,24 +1064,12 @@ ensure_all_checkpoints() {
 cached_sdk_is_valid() {
   local directory=$1 target sysroot
   [[ ! -e "$directory/.host" && ! -L "$directory/.host" ]] || return 1
-  [[ -r "$directory/BUILD-MANIFEST.json" ]] || return 1
-  python3 - "$directory/BUILD-MANIFEST.json" "$RELEASE_PROFILE" <<'PY' || return 1
-import json
-import pathlib
-import sys
-
-manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
-release = manifest.get('release_optimization', {})
-standalone = manifest.get('standalone_toolchains', {})
-raise SystemExit(0 if (
-    release.get('profile') == sys.argv[2]
-    and standalone.get('directory_copy_supported') is True
-    and standalone.get('local_pkgconf') == 'libexec/pkgconf'
-    and standalone.get('root_host_directory_present') is False
-) else 1)
-PY
+  [[ ! -e "$directory/README.md" && ! -L "$directory/README.md" ]] || return 1
+  [[ ! -e "$directory/BUILD-MANIFEST.json" && ! -L "$directory/BUILD-MANIFEST.json" ]] || return 1
+  [[ ! -e "$directory/SOURCE-LOCK.json" && ! -L "$directory/SOURCE-LOCK.json" ]] || return 1
   for target in "${TARGETS[@]}"; do
     sysroot="$directory/$target/$target"
+    [[ ! -e "$directory/$target/README.md" && ! -L "$directory/$target/README.md" ]] || return 1
     [[ -x "$directory/$target/bin/$target-gcc" ]] || return 1
     [[ -x "$directory/$target/bin/$target-g++" ]] || return 1
     [[ -x "$directory/$target/bin/$target-pkg-config" ]] || return 1
@@ -1106,13 +1094,10 @@ build_assembled_sdk_once() {
     cp -a "$CHECKPOINT_ROOT/integrations/$target/pciutils/." "$sysroot/"
     install_toolchain_pkgconf "$CHECKPOINT_ROOT/host/pkgconf" "$temporary/$target"
     write_pkg_config_wrapper "$temporary" "$target"
-    write_toolchain_readme "$temporary/$target" "$target" "$SDK_VERSION"
   done
   # Checkpoints contain pristine toolchains.  Strip only this materialized
   # release tree, so retries and targeted diagnostics keep their symbols.
   apply_release_profile "$temporary"
-  write_sdk_readme "$temporary" "$SDK_VERSION"
-  write_build_manifest "$temporary" "$SDK_VERSION"
   check_required_layout "$temporary"
   TARGET_FILTER=$saved_filter
 }
@@ -1134,168 +1119,9 @@ assemble_sdk_checkpoint() {
   printf '%s\n' "$destination"
 }
 
-write_toolchain_readme() {
-  local toolchain_root=$1 target=$2 version=$3
-  printf '%s\n' \
-    "# NBL SDK $version: $target toolchain" \
-    '' \
-    'This directory is a complete, relocatable cross-toolchain unit. Copy the' \
-    'entire directory anywhere on an x86_64 Linux host; it may also be renamed.' \
-    'Keep `bin/`, `libexec/`, and the nested target sysroot together.' \
-    '' \
-    'It contains the prefixed compiler/binutils, C/C++ runtime and sysroot, the' \
-    'static OpenSSL and libpci integrations, and a static `libexec/pkgconf` used by' \
-    'the `<triplet>-pkg-config` wrapper. No file outside this directory is' \
-    'required at compile or pkg-config runtime.' \
-    '' \
-    '## Example' \
-    '' \
-    '```sh' \
-    "TOOLCHAIN=/opt/toolchains/$target" \
-    "CC=\$TOOLCHAIN/bin/$target-gcc" \
-    "PKG=\$TOOLCHAIN/bin/$target-pkg-config" \
-    '"$CC" -static hello.c -o hello' \
-    '"$CC" -static tls.c -o tls $($PKG --cflags --libs openssl)' \
-    '```' \
-    >"$toolchain_root/README.md"
-}
-
-write_sdk_readme() {
-  local sdk_root=$1 version=$2
-  printf '%s\n' \
-    "# NBL SDK $version" \
-    '' \
-    'NBL SDK is a relocatable, static-linking cross SDK. It runs on an x86_64' \
-    'Linux host and generates Linux/musl programs for these targets:' \
-    '' \
-    '- `aarch64-linux-musl`' \
-    '- `loongarch64-linux-musl`' \
-    '- `riscv64-linux-musl`' \
-    '- `sw_64-linux-musl`' \
-    '- `x86_64-linux-musl`' \
-    '' \
-    'No environment-activation script is required. Every `<triplet>/` directory' \
-    'is a complete standalone toolchain: copy the entire directory (not only' \
-    '`bin/`) anywhere, optionally rename it, and use it without the rest of' \
-    'this SDK. Its `bin/` contains prefixed tools and its `libexec/pkgconf` is' \
-    'a toolchain-local static executable; nested `<triplet>/include`, `<triplet>/lib`, and' \
-    '`<triplet>/lib/pkgconfig` form the target sysroot.' \
-    '' \
-    'The SDK root deliberately contains no `.host/` directory.' \
-    '' \
-    'Every `<triplet>-pkg-config` wrapper finds its own toolchain directory,' \
-    'selects only that target sysroot, and always enables static dependency' \
-    'expansion. It has no runtime dependency outside that toolchain directory.' \
-    '' \
-    '## Static C example' \
-    '' \
-    '```sh' \
-    "nbl-sdk-$version/x86_64-linux-musl/bin/x86_64-linux-musl-gcc -static hello.c -o hello" \
-    '```' \
-    '' \
-    '## OpenSSL and libpci example' \
-    '' \
-    '```sh' \
-    "SDK=nbl-sdk-$version" \
-    'CC=$SDK/x86_64-linux-musl/bin/x86_64-linux-musl-gcc' \
-    'PKG=$SDK/x86_64-linux-musl/bin/x86_64-linux-musl-pkg-config' \
-    '$PKG --cflags --libs openssl' \
-    '$CC -static tls.c -o tls $($PKG --cflags --libs openssl)' \
-    '$CC -static pci.c -o pci $($PKG --cflags --libs libpci)' \
-    '```' \
-    '' \
-    '## Copy one toolchain' \
-    '' \
-    '```sh' \
-    "cp -a nbl-sdk-$version/aarch64-linux-musl /opt/toolchains/aarch64" \
-    'CC=/opt/toolchains/aarch64/bin/aarch64-linux-musl-gcc' \
-    'PKG=/opt/toolchains/aarch64/bin/aarch64-linux-musl-pkg-config' \
-    '$CC -static hello.c -o hello' \
-    '$CC -static tls.c -o tls $($PKG --cflags --libs openssl)' \
-    '```' \
-    '' \
-    'OpenSSL ships only `libssl.a` and `libcrypto.a`. libpci is built with DNS,' \
-    'zlib, libkmod, and HWDB backends disabled, so this SDK does not need to' \
-    'ship zlib as a private libpci dependency.' \
-    '' \
-    'Release packaging removes DWARF debug sections from host-side SDK tools' \
-    'and target static archives. This preserves normal compiler and linker' \
-    'functionality while keeping the delivered SDK compact.' \
-    '' \
-    'See `BUILD-MANIFEST.json` and `SOURCE-LOCK.json` for exact source,' \
-    'patchset, submodule, and container-image provenance.' \
-    >"$sdk_root/README.md"
-}
-
-write_build_manifest() {
-  local sdk_root=$1 version=$2
-  python3 - "$LOCK_FILE" "$sdk_root/BUILD-MANIFEST.json" "$version" "${NBL_SDK_BUILDER_IMAGE:-unknown}" "$RELEASE_PROFILE" <<'PY'
-import hashlib
-import json
-import pathlib
-import sys
-
-lock_path = pathlib.Path(sys.argv[1])
-output_path = pathlib.Path(sys.argv[2])
-lock = json.loads(lock_path.read_text(encoding='utf-8'))
-manifest = {
-    'schema': 5,
-    'sdk_version': sys.argv[3],
-    'source_date_epoch': lock['source_date_epoch'],
-    'targets': [
-        'aarch64-linux-musl',
-        'loongarch64-linux-musl',
-        'riscv64-linux-musl',
-        'sw_64-linux-musl',
-        'x86_64-linux-musl',
-    ],
-    'musl_cross_make': lock['musl_cross_make'],
-    'sources': lock['sources'],
-    'patches': lock['patches'],
-    'container_image': {
-        **lock['container'],
-        'builder_image_reference': sys.argv[4],
-    },
-    'integrations': {
-        'openssl': {
-            'static_only': True,
-            'assembly': 'disabled; SW64 uses the generic C path',
-        },
-        'pciutils': {
-            'library': 'libpci.a',
-            'dns': False,
-            'hwdb': False,
-            'libkmod': False,
-            'zlib': False,
-        },
-        'pkgconf': {
-            'host_static': True,
-            'wrapper_default': '--static',
-        },
-    },
-    'standalone_toolchains': {
-        'directory_copy_supported': True,
-        'copy_unit': '<triplet>/',
-        'local_pkgconf': 'libexec/pkgconf',
-        'pkg_config_wrapper': 'bin/<triplet>-pkg-config',
-        'root_host_directory_present': False,
-    },
-    'release_optimization': {
-        'profile': sys.argv[5],
-        'host_elf_debug_sections': 'stripped',
-        'target_static_archive_debug_sections': 'stripped',
-    },
-    'source_lock_sha256': hashlib.sha256(lock_path.read_bytes()).hexdigest(),
-}
-output_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-PY
-  cp "$LOCK_FILE" "$sdk_root/SOURCE-LOCK.json"
-}
-
 check_required_toolchain_layout() {
   local toolchain_root=$1 target=$2 sysroot tool
   [[ -d "$toolchain_root" ]] || die "toolchain directory is missing: $toolchain_root"
-  [[ -r "$toolchain_root/README.md" ]] || die "toolchain README is missing: $toolchain_root/README.md"
   [[ ! -e "$toolchain_root/bin/pkgconf" && ! -L "$toolchain_root/bin/pkgconf" ]] || die "pkgconf must reside in libexec for $target"
   [[ -x "$toolchain_root/libexec/pkgconf" ]] || die "toolchain-local static pkgconf is missing for $target"
   sysroot="$toolchain_root/$target"
@@ -1468,11 +1294,16 @@ verify_archive_layout() {
   # the first entry would otherwise make tar report SIGPIPE (status 141).
   top=$(tar -tJf "$archive" | awk -F/ 'NF && !seen { top=$1; seen=1 } END { if (seen) print top }')
   [[ "$top" == nbl-sdk-* ]] || die "archive root is not nbl-sdk-<version>: $top"
-  if tar -tJf "$archive" | grep -Eq '/(stage1|sources|source-cache|\.nbl-sdk-cache)(/|$)'; then
+  # Do not use grep -q here: with pipefail it can close the pipe early and
+  # make tar report SIGPIPE instead of allowing the match to be observed.
+  if tar -tJf "$archive" | grep -E '/(stage1|sources|source-cache|\.nbl-sdk-cache)(/|$)' >/dev/null; then
     die 'archive contains a stage-one toolchain, source cache, or build cache'
   fi
-  if tar -tJf "$archive" | grep -Eq '^nbl-sdk-[^/]+/\.host(/|$)'; then
+  if tar -tJf "$archive" | grep -E '^nbl-sdk-[^/]+/\.host(/|$)' >/dev/null; then
     die 'archive contains the removed SDK-root .host directory'
+  fi
+  if tar -tJf "$archive" | grep -E '^nbl-sdk-[^/]+/(README\.md|BUILD-MANIFEST\.json|SOURCE-LOCK\.json|[^/]+/README\.md)$' >/dev/null; then
+    die 'archive contains generated documentation or provenance metadata'
   fi
 }
 
@@ -1490,7 +1321,7 @@ verify_archive() {
   tar -xJf "$archive" -C "$verify_work"
   local root
   root=$(find "$verify_work" -mindepth 1 -maxdepth 1 -type d -name 'nbl-sdk-*' -print -quit)
-  [[ -n "$root" && -f "$root/README.md" && -f "$root/BUILD-MANIFEST.json" && -f "$root/SOURCE-LOCK.json" ]] || die 'archive is missing required SDK root files'
+  [[ -n "$root" ]] || die 'archive is missing its SDK root directory'
   TARGET_FILTER=
   validate_sdk "$root" "$verify_work/validation" 'clean archive extraction' 1
   TARGET_FILTER=$saved_filter
@@ -1529,7 +1360,6 @@ materialize_selected_sdk() {
     cp -a "$CHECKPOINT_ROOT/integrations/$target/pciutils/." "$sysroot/"
     install_toolchain_pkgconf "$CHECKPOINT_ROOT/host/pkgconf" "$destination/$target"
     write_pkg_config_wrapper "$destination" "$target"
-    write_toolchain_readme "$destination/$target" "$target" "$SDK_VERSION"
   done
   apply_release_profile "$destination"
 }
