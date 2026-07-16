@@ -9,6 +9,15 @@ x86_64 Linux host. The delivered SDK contains cross toolchains for:
 - `sw_64-linux-musl`
 - `x86_64-linux-musl`
 
+Each `<triplet>/` directory is a complete standalone toolchain unit. Copy the
+whole directory—rather than only `bin/`—to any location on an x86_64 Linux
+host (and optionally rename it); its compiler, sysroot, OpenSSL/libpci
+integration, and static `libexec/pkgconf` remain usable without the rest of
+the SDK.
+
+The delivered SDK root has no `.host/` directory: each target owns its static
+`pkgconf` at `<triplet>/libexec/pkgconf`.
+
 The host entrypoint only checks arguments and rootless Podman, builds or uses
 the pinned builder image, and mounts the cache and artifact directories. Every
 source download, compilation, validation step, and archive operation happens
@@ -37,7 +46,8 @@ commit and patchset before use.
 # Materialize the cached complete SDK without creating an archive.
 ./nbl-sdk assemble
 
-# Compile/link checks for one cached target; add --relocate for its move check.
+# Compile/link checks for one cached target, including a renamed standalone copy.
+# Add --relocate for an additional complete-SDK move check.
 ./nbl-sdk validate-sdk --target aarch64-linux-musl --relocate
 
 # Package and run the full all-target archive validation from checkpoints.
@@ -88,8 +98,11 @@ tree or archive. `clean` retains both source and checkpoint caches; use
 `clean --stages` to remove checkpoints or `clean --all` to remove both them and
 the verified source cache.
 
-The output is `dist/nbl-sdk-<version>.tar.xz` by default. Its root README
-explains direct compiler and pkg-config usage; no activation script is needed.
+The output is `dist/nbl-sdk-<version>.tar.xz` by default. Its root README and
+each target directory's README explain direct compiler and pkg-config usage;
+no activation script is needed. The package verifier extracts the archive,
+copies each target directory alone to a renamed location, and verifies static
+C/C++/OpenSSL/libpci links from that isolated copy.
 Release materialization strips only DWARF debug sections from host-side SDK
 ELF tools and target static archives. Pristine reusable checkpoints retain
 their symbols, while the delivered toolchains, headers, static libraries, and

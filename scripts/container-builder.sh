@@ -420,19 +420,15 @@ is_x86_64_host_elf() {
 }
 
 release_strip_host_elf_debug_symbols() {
-  local sdk_root=$1 root record inode candidate canonical before after
+  local sdk_root=$1 target root record inode candidate canonical before after
   local stripped=0 saved=0 relinked=0
   local -A canonical_by_inode=()
   local -A stripped_by_inode=()
 
-  for root in "$sdk_root/.host" "${TARGETS[@]/#/$sdk_root/}"; do
-    [[ -d "$root" ]] || continue
-    case "$root" in
-      "$sdk_root/.host") ;;
-      *)
-        [[ -d "$root/bin" || -d "$root/libexec" ]] || continue
-        ;;
-    esac
+  for target in "${TARGETS[@]}"; do
+    target_is_selected "$target" || continue
+    root="$sdk_root/$target"
+    [[ -d "$root/bin" || -d "$root/libexec" ]] || continue
     while IFS= read -r -d '' record; do
       inode=${record%%$'\t'*}
       candidate=${record#*$'\t'}
@@ -455,11 +451,7 @@ release_strip_host_elf_debug_symbols() {
       stripped=$((stripped + 1))
       stripped_by_inode[$inode]=1
     done < <(
-      if [[ "$root" == "$sdk_root/.host" ]]; then
-        find "$root" -type f -printf '%D:%i\t%p\0'
-      else
-        find "$root/bin" "$root/libexec" -type f -printf '%D:%i\t%p\0' 2>/dev/null || true
-      fi
+      find "$root/bin" "$root/libexec" -type f -printf '%D:%i\t%p\0' 2>/dev/null || true
     )
   done
   log "release profile $RELEASE_PROFILE: stripped $stripped host ELF files ($saved bytes; restored $relinked hard links)"
@@ -542,33 +534,27 @@ assert_no_debug_sections() {
   fi
 }
 
-assert_release_profile() {
-  local sdk_root=$1 target root candidate reader
-  for root in "$sdk_root/.host" "${TARGETS[@]/#/$sdk_root/}"; do
-    [[ -d "$root" ]] || continue
-    if [[ "$root" != "$sdk_root/.host" ]]; then
-      target=$(basename -- "$root")
-      target_is_selected "$target" || continue
-    fi
-    while IFS= read -r -d '' candidate; do
-      is_x86_64_host_elf "$candidate" || continue
-      assert_no_debug_sections readelf "$candidate"
-    done < <(
-      if [[ "$root" == "$sdk_root/.host" ]]; then
-        find "$root" -type f -print0
-      else
-        find "$root/bin" "$root/libexec" -type f -print0 2>/dev/null || true
-      fi
-    )
-  done
+assert_toolchain_release_profile() {
+  local toolchain_root=$1 target=$2 candidate reader
+  while IFS= read -r -d '' candidate; do
+    is_x86_64_host_elf "$candidate" || continue
+    assert_no_debug_sections readelf "$candidate"
+  done < <(
+    find "$toolchain_root/bin" "$toolchain_root/libexec" -type f -print0 2>/dev/null || true
+  )
 
+  reader="$toolchain_root/bin/$target-readelf"
+  [[ -x "$reader" ]] || die "release profile is missing $target-readelf"
+  while IFS= read -r -d '' candidate; do
+    assert_no_debug_sections "$reader" "$candidate"
+  done < <(find "$toolchain_root" -type f -name '*.a' -print0)
+}
+
+assert_release_profile() {
+  local sdk_root=$1 target
   for target in "${TARGETS[@]}"; do
     target_is_selected "$target" || continue
-    reader="$sdk_root/$target/bin/$target-readelf"
-    [[ -x "$reader" ]] || die "release profile is missing $target-readelf"
-    while IFS= read -r -d '' candidate; do
-      assert_no_debug_sections "$reader" "$candidate"
-    done < <(find "$sdk_root/$target" -type f -name '*.a' -print0)
+    assert_toolchain_release_profile "$sdk_root/$target" "$target"
   done
 }
 
@@ -779,7 +765,7 @@ build_pciutils() {
 }
 
 build_pkgconf() {
-  local workspace=$1 sdk_root=$2 stage_one=$3
+  local workspace=$1 output_root=$2 stage_one=$3
   local pkgconf_version source_root install_root cc
   pkgconf_version=$(source_version pkgconf)
   source_root="$workspace/pkgconf-host-build"
@@ -804,9 +790,20 @@ build_pkgconf() {
     make "DESTDIR=$install_root" install
   )
 
-  mkdir -p "$sdk_root/.host/bin"
-  install -m 0755 "$install_root/bin/pkgconf" "$sdk_root/.host/bin/pkgconf"
-  assert_static_host_elf "$sdk_root/.host/bin/pkgconf"
+  mkdir -p "$output_root"
+  install -m 0755 "$install_root/bin/pkgconf" "$output_root/pkgconf"
+  assert_static_host_elf "$output_root/pkgconf"
+}
+
+install_toolchain_pkgconf() {
+  local source=$1 toolchain_root=$2 destination
+  destination="$toolchain_root/libexec/pkgconf"
+  [[ -x "$source" ]] || die "static pkgconf is missing: $source"
+  mkdir -p "$toolchain_root/libexec"
+  # Use a real copy so a target directory remains complete when copied out of
+  # the SDK or extracted alone.
+  install -m 0755 "$source" "$destination"
+  [[ -x "$destination" ]] || die "failed to install toolchain-local pkgconf: $destination"
 }
 
 write_pkg_config_wrapper() {
@@ -821,13 +818,23 @@ write_pkg_config_wrapper() {
     '  *) self=$(command -v -- "$self") ;;' \
     'esac' \
     'bindir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P)' \
-    'triplet=$(basename -- "$(dirname -- "$bindir")")' \
-    'sdk_root=$(CDPATH= cd -- "$bindir/../.." && pwd -P)' \
-    'sysroot="$sdk_root/$triplet/$triplet"' \
+    'toolchain_root=$(CDPATH= cd -- "$bindir/.." && pwd -P)' \
+    'wrapper_name=$(basename -- "$self")' \
+    'triplet=${wrapper_name%-pkg-config}' \
+    '[ "$triplet" != "$wrapper_name" ] || {' \
+    '  printf "%s\\n" "nbl-sdk pkg-config wrapper: unexpected wrapper name: $wrapper_name" >&2' \
+    '  exit 127' \
+    '}' \
+    'sysroot="$toolchain_root/$triplet"' \
+    'pkgconf="$toolchain_root/libexec/pkgconf"' \
+    '[ -x "$pkgconf" ] || {' \
+    '  printf "%s\\n" "nbl-sdk pkg-config wrapper: bundled pkgconf is missing: $pkgconf" >&2' \
+    '  exit 127' \
+    '}' \
     'unset PKG_CONFIG_PATH' \
     'export PKG_CONFIG_SYSROOT_DIR="$sysroot"' \
     'export PKG_CONFIG_LIBDIR="$sysroot/lib/pkgconfig:$sysroot/share/pkgconfig"' \
-    'exec "$sdk_root/.host/bin/pkgconf" --static "$@"' \
+    'exec "$pkgconf" --static "$@"' \
     >"$wrapper"
   chmod 0755 "$wrapper"
 }
@@ -918,7 +925,7 @@ build_pkgconf_checkpoint_once() {
   rm -rf -- "$scratch" "$WORK_DIR/pkgconf-work"
   mkdir -p "$scratch" "$WORK_DIR/pkgconf-work" "$temporary"
   build_pkgconf "$WORK_DIR/pkgconf-work" "$scratch" "$CHECKPOINT_ROOT/stage-one"
-  install -m 0755 "$scratch/.host/bin/pkgconf" "$temporary/pkgconf"
+  install -m 0755 "$scratch/pkgconf" "$temporary/pkgconf"
   assert_static_host_elf "$temporary/pkgconf"
 }
 
@@ -1056,7 +1063,7 @@ ensure_all_checkpoints() {
 
 cached_sdk_is_valid() {
   local directory=$1 target sysroot
-  [[ -x "$directory/.host/bin/pkgconf" ]] || return 1
+  [[ ! -e "$directory/.host" && ! -L "$directory/.host" ]] || return 1
   [[ -r "$directory/BUILD-MANIFEST.json" ]] || return 1
   python3 - "$directory/BUILD-MANIFEST.json" "$RELEASE_PROFILE" <<'PY' || return 1
 import json
@@ -1065,13 +1072,21 @@ import sys
 
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
 release = manifest.get('release_optimization', {})
-raise SystemExit(0 if release.get('profile') == sys.argv[2] else 1)
+standalone = manifest.get('standalone_toolchains', {})
+raise SystemExit(0 if (
+    release.get('profile') == sys.argv[2]
+    and standalone.get('directory_copy_supported') is True
+    and standalone.get('local_pkgconf') == 'libexec/pkgconf'
+    and standalone.get('root_host_directory_present') is False
+) else 1)
 PY
   for target in "${TARGETS[@]}"; do
     sysroot="$directory/$target/$target"
     [[ -x "$directory/$target/bin/$target-gcc" ]] || return 1
     [[ -x "$directory/$target/bin/$target-g++" ]] || return 1
     [[ -x "$directory/$target/bin/$target-pkg-config" ]] || return 1
+    [[ ! -e "$directory/$target/bin/pkgconf" && ! -L "$directory/$target/bin/pkgconf" ]] || return 1
+    [[ -x "$directory/$target/libexec/pkgconf" ]] || return 1
     [[ -f "$sysroot/lib/libssl.a" ]] || return 1
     [[ -f "$sysroot/lib/libcrypto.a" ]] || return 1
     [[ -f "$sysroot/lib/libpci.a" ]] || return 1
@@ -1083,16 +1098,15 @@ build_assembled_sdk_once() {
   local temporary=$1 target sysroot saved_filter=$TARGET_FILTER
   TARGET_FILTER=
   rm -rf -- "$temporary"
-  mkdir -p "$temporary/.host/bin"
+  mkdir -p "$temporary"
   for target in "${TARGETS[@]}"; do
     cp -a "$CHECKPOINT_ROOT/toolchains/$target" "$temporary/$target"
     sysroot="$temporary/$target/$target"
     cp -a "$CHECKPOINT_ROOT/integrations/$target/openssl/." "$sysroot/"
     cp -a "$CHECKPOINT_ROOT/integrations/$target/pciutils/." "$sysroot/"
-  done
-  install -m 0755 "$CHECKPOINT_ROOT/host/pkgconf" "$temporary/.host/bin/pkgconf"
-  for target in "${TARGETS[@]}"; do
+    install_toolchain_pkgconf "$CHECKPOINT_ROOT/host/pkgconf" "$temporary/$target"
     write_pkg_config_wrapper "$temporary" "$target"
+    write_toolchain_readme "$temporary/$target" "$target" "$SDK_VERSION"
   done
   # Checkpoints contain pristine toolchains.  Strip only this materialized
   # release tree, so retries and targeted diagnostics keep their symbols.
@@ -1120,6 +1134,32 @@ assemble_sdk_checkpoint() {
   printf '%s\n' "$destination"
 }
 
+write_toolchain_readme() {
+  local toolchain_root=$1 target=$2 version=$3
+  printf '%s\n' \
+    "# NBL SDK $version: $target toolchain" \
+    '' \
+    'This directory is a complete, relocatable cross-toolchain unit. Copy the' \
+    'entire directory anywhere on an x86_64 Linux host; it may also be renamed.' \
+    'Keep `bin/`, `libexec/`, and the nested target sysroot together.' \
+    '' \
+    'It contains the prefixed compiler/binutils, C/C++ runtime and sysroot, the' \
+    'static OpenSSL and libpci integrations, and a static `libexec/pkgconf` used by' \
+    'the `<triplet>-pkg-config` wrapper. No file outside this directory is' \
+    'required at compile or pkg-config runtime.' \
+    '' \
+    '## Example' \
+    '' \
+    '```sh' \
+    "TOOLCHAIN=/opt/toolchains/$target" \
+    "CC=\$TOOLCHAIN/bin/$target-gcc" \
+    "PKG=\$TOOLCHAIN/bin/$target-pkg-config" \
+    '"$CC" -static hello.c -o hello' \
+    '"$CC" -static tls.c -o tls $($PKG --cflags --libs openssl)' \
+    '```' \
+    >"$toolchain_root/README.md"
+}
+
 write_sdk_readme() {
   local sdk_root=$1 version=$2
   printf '%s\n' \
@@ -1134,14 +1174,18 @@ write_sdk_readme() {
     '- `sw_64-linux-musl`' \
     '- `x86_64-linux-musl`' \
     '' \
-    'No environment-activation script is required. Each target directory has' \
-    'the standard musl-cross-make layout: `bin/` contains prefixed tools and' \
-    '`<triplet>/include`, `<triplet>/lib`, and `<triplet>/lib/pkgconfig` are' \
-    'the target sysroot.' \
+    'No environment-activation script is required. Every `<triplet>/` directory' \
+    'is a complete standalone toolchain: copy the entire directory (not only' \
+    '`bin/`) anywhere, optionally rename it, and use it without the rest of' \
+    'this SDK. Its `bin/` contains prefixed tools and its `libexec/pkgconf` is' \
+    'a toolchain-local static executable; nested `<triplet>/include`, `<triplet>/lib`, and' \
+    '`<triplet>/lib/pkgconfig` form the target sysroot.' \
     '' \
-    'The `.host/bin/pkgconf` program is a static x86_64 host executable. Every' \
-    '`<triplet>-pkg-config` wrapper finds the SDK relative to itself, selects' \
-    'only that target sysroot, and always enables static dependency expansion.' \
+    'The SDK root deliberately contains no `.host/` directory.' \
+    '' \
+    'Every `<triplet>-pkg-config` wrapper finds its own toolchain directory,' \
+    'selects only that target sysroot, and always enables static dependency' \
+    'expansion. It has no runtime dependency outside that toolchain directory.' \
     '' \
     '## Static C example' \
     '' \
@@ -1158,6 +1202,16 @@ write_sdk_readme() {
     '$PKG --cflags --libs openssl' \
     '$CC -static tls.c -o tls $($PKG --cflags --libs openssl)' \
     '$CC -static pci.c -o pci $($PKG --cflags --libs libpci)' \
+    '```' \
+    '' \
+    '## Copy one toolchain' \
+    '' \
+    '```sh' \
+    "cp -a nbl-sdk-$version/aarch64-linux-musl /opt/toolchains/aarch64" \
+    'CC=/opt/toolchains/aarch64/bin/aarch64-linux-musl-gcc' \
+    'PKG=/opt/toolchains/aarch64/bin/aarch64-linux-musl-pkg-config' \
+    '$CC -static hello.c -o hello' \
+    '$CC -static tls.c -o tls $($PKG --cflags --libs openssl)' \
     '```' \
     '' \
     'OpenSSL ships only `libssl.a` and `libcrypto.a`. libpci is built with DNS,' \
@@ -1185,7 +1239,7 @@ lock_path = pathlib.Path(sys.argv[1])
 output_path = pathlib.Path(sys.argv[2])
 lock = json.loads(lock_path.read_text(encoding='utf-8'))
 manifest = {
-    'schema': 2,
+    'schema': 5,
     'sdk_version': sys.argv[3],
     'source_date_epoch': lock['source_date_epoch'],
     'targets': [
@@ -1219,6 +1273,13 @@ manifest = {
             'wrapper_default': '--static',
         },
     },
+    'standalone_toolchains': {
+        'directory_copy_supported': True,
+        'copy_unit': '<triplet>/',
+        'local_pkgconf': 'libexec/pkgconf',
+        'pkg_config_wrapper': 'bin/<triplet>-pkg-config',
+        'root_host_directory_present': False,
+    },
     'release_optimization': {
         'profile': sys.argv[5],
         'host_elf_debug_sections': 'stripped',
@@ -1231,25 +1292,34 @@ PY
   cp "$LOCK_FILE" "$sdk_root/SOURCE-LOCK.json"
 }
 
+check_required_toolchain_layout() {
+  local toolchain_root=$1 target=$2 sysroot tool
+  [[ -d "$toolchain_root" ]] || die "toolchain directory is missing: $toolchain_root"
+  [[ -r "$toolchain_root/README.md" ]] || die "toolchain README is missing: $toolchain_root/README.md"
+  [[ ! -e "$toolchain_root/bin/pkgconf" && ! -L "$toolchain_root/bin/pkgconf" ]] || die "pkgconf must reside in libexec for $target"
+  [[ -x "$toolchain_root/libexec/pkgconf" ]] || die "toolchain-local static pkgconf is missing for $target"
+  sysroot="$toolchain_root/$target"
+  for tool in gcc g++ ar ld pkg-config; do
+    [[ -x "$toolchain_root/bin/$target-$tool" ]] || die "missing $target-$tool"
+  done
+  [[ -d "$sysroot/include" ]] || die "missing sysroot includes for $target"
+  [[ -d "$sysroot/lib" ]] || die "missing sysroot libraries for $target"
+  [[ -d "$sysroot/lib/pkgconfig" ]] || die "missing pkg-config directory for $target"
+  [[ -f "$sysroot/lib/libssl.a" ]] || die "missing libssl.a for $target"
+  [[ -f "$sysroot/lib/libcrypto.a" ]] || die "missing libcrypto.a for $target"
+  [[ -f "$sysroot/lib/libpci.a" ]] || die "missing libpci.a for $target"
+  [[ -f "$sysroot/include/openssl/evp.h" ]] || die "missing OpenSSL headers for $target"
+  [[ -f "$sysroot/include/pci/pci.h" ]] || die "missing pciutils headers for $target"
+  [[ -f "$sysroot/lib/pkgconfig/openssl.pc" ]] || die "missing openssl.pc for $target"
+  [[ -f "$sysroot/lib/pkgconfig/libpci.pc" ]] || die "missing libpci.pc for $target"
+}
+
 check_required_layout() {
-  local sdk_root=$1 target sysroot tool
-  [[ -x "$sdk_root/.host/bin/pkgconf" ]] || die 'static host pkgconf is missing'
+  local sdk_root=$1 target
+  [[ ! -e "$sdk_root/.host" && ! -L "$sdk_root/.host" ]] || die 'delivered SDK must not contain .host'
   for target in "${TARGETS[@]}"; do
     target_is_selected "$target" || continue
-    sysroot="$sdk_root/$target/$target"
-    for tool in gcc g++ ar ld pkg-config; do
-      [[ -x "$sdk_root/$target/bin/$target-$tool" ]] || die "missing $target-$tool"
-    done
-    [[ -d "$sysroot/include" ]] || die "missing sysroot includes for $target"
-    [[ -d "$sysroot/lib" ]] || die "missing sysroot libraries for $target"
-    [[ -d "$sysroot/lib/pkgconfig" ]] || die "missing pkg-config directory for $target"
-    [[ -f "$sysroot/lib/libssl.a" ]] || die "missing libssl.a for $target"
-    [[ -f "$sysroot/lib/libcrypto.a" ]] || die "missing libcrypto.a for $target"
-    [[ -f "$sysroot/lib/libpci.a" ]] || die "missing libpci.a for $target"
-    [[ -f "$sysroot/include/openssl/evp.h" ]] || die "missing OpenSSL headers for $target"
-    [[ -f "$sysroot/include/pci/pci.h" ]] || die "missing pciutils headers for $target"
-    [[ -f "$sysroot/lib/pkgconfig/openssl.pc" ]] || die "missing openssl.pc for $target"
-    [[ -f "$sysroot/lib/pkgconfig/libpci.pc" ]] || die "missing libpci.pc for $target"
+    check_required_toolchain_layout "$sdk_root/$target" "$target"
   done
 }
 
@@ -1305,12 +1375,69 @@ write_validation_sources() {
     >"$directory/pci.c"
 }
 
+validate_toolchain_compilation() {
+  local toolchain_root=$1 target=$2 validation_root=$3 label=$4
+  local cc cxx pkg readelf_tool openssl_flags pci_flags
+  log "validating toolchain compilation ($label): $toolchain_root"
+  rm -rf -- "$validation_root"
+  mkdir -p "$validation_root"
+  cc="$toolchain_root/bin/$target-gcc"
+  cxx="$toolchain_root/bin/$target-g++"
+  pkg="$toolchain_root/bin/$target-pkg-config"
+  readelf_tool="$toolchain_root/bin/$target-readelf"
+  write_validation_sources "$validation_root"
+
+  "$cc" -static "$validation_root/hello.c" -o "$validation_root/hello-c"
+  "$cxx" -static "$validation_root/hello.cc" -o "$validation_root/hello-cxx"
+
+  openssl_flags=$("$pkg" --cflags --libs openssl)
+  pci_flags=$("$pkg" --cflags --libs libpci)
+  [[ "$openssl_flags" == *-lssl* && "$openssl_flags" == *-lcrypto* ]] || die "OpenSSL pkg-config flags are incomplete for $target: $openssl_flags"
+  [[ "$pci_flags" == *-lpci* ]] || die "libpci pkg-config flags are incomplete for $target: $pci_flags"
+  [[ "$openssl_flags" != *"/usr/include"* && "$pci_flags" != *"/usr/include"* ]] || die "pkg-config leaked host include paths for $target"
+
+  # The .pc files are generated by this SDK and use paths without spaces.
+  # Deliberate word splitting converts pkgconf's flags into compiler args.
+  # shellcheck disable=SC2086
+  "$cc" -static "$validation_root/openssl.c" -o "$validation_root/openssl" $openssl_flags
+  # shellcheck disable=SC2086
+  "$cc" -static "$validation_root/pci.c" -o "$validation_root/pci" $pci_flags
+
+  verify_target_elf "$target" "$validation_root/hello-c" "$readelf_tool"
+  verify_target_elf "$target" "$validation_root/hello-cxx" "$readelf_tool"
+  verify_target_elf "$target" "$validation_root/openssl" "$readelf_tool"
+  verify_target_elf "$target" "$validation_root/pci" "$readelf_tool"
+}
+
+validate_standalone_toolchain() {
+  local toolchain_root=$1 target=$2 validation_root=$3 label=$4
+  log "validating standalone toolchain ($label): $toolchain_root"
+  check_required_toolchain_layout "$toolchain_root" "$target"
+  assert_static_tool_tree "$toolchain_root"
+  assert_toolchain_release_profile "$toolchain_root" "$target"
+  validate_toolchain_compilation "$toolchain_root" "$target" "$validation_root" "$label"
+}
+
+validate_independent_toolchain_copy() {
+  local sdk_root=$1 target=$2 validation_root=$3 label=$4
+  local copied_toolchain copied_validation
+  copied_toolchain="$validation_root/${target}-toolchain-copy"
+  copied_validation="$validation_root/${target}-validation"
+  rm -rf -- "$copied_toolchain" "$copied_validation"
+  mkdir -p "$validation_root"
+  # Deliberately rename the copied directory.  This catches wrapper paths that
+  # accidentally depend on either the SDK root or the original directory name.
+  cp -a "$sdk_root/$target" "$copied_toolchain"
+  validate_standalone_toolchain "$copied_toolchain" "$target" "$copied_validation" \
+    "independently copied $target from $label"
+  rm -rf -- "$copied_toolchain"
+}
+
 validate_sdk() {
-  local sdk_root=$1 validation_root=$2 label=$3
-  local target cc cxx pkg readelf_tool target_dir openssl_flags pci_flags
+  local sdk_root=$1 validation_root=$2 label=$3 validate_standalone=${4:-0}
+  local target
   log "validating SDK ($label): $sdk_root"
   check_required_layout "$sdk_root"
-  assert_static_tool_tree "$sdk_root/.host"
   for target in "${TARGETS[@]}"; do
     target_is_selected "$target" || continue
     assert_static_tool_tree "$sdk_root/$target"
@@ -1321,34 +1448,17 @@ validate_sdk() {
   mkdir -p "$validation_root"
   for target in "${TARGETS[@]}"; do
     target_is_selected "$target" || continue
-    cc="$sdk_root/$target/bin/$target-gcc"
-    cxx="$sdk_root/$target/bin/$target-g++"
-    pkg="$sdk_root/$target/bin/$target-pkg-config"
-    readelf_tool="$sdk_root/$target/bin/$target-readelf"
-    target_dir="$validation_root/$target"
-    write_validation_sources "$target_dir"
-
-    "$cc" -static "$target_dir/hello.c" -o "$target_dir/hello-c"
-    "$cxx" -static "$target_dir/hello.cc" -o "$target_dir/hello-cxx"
-
-    openssl_flags=$("$pkg" --cflags --libs openssl)
-    pci_flags=$("$pkg" --cflags --libs libpci)
-    [[ "$openssl_flags" == *-lssl* && "$openssl_flags" == *-lcrypto* ]] || die "OpenSSL pkg-config flags are incomplete for $target: $openssl_flags"
-    [[ "$pci_flags" == *-lpci* ]] || die "libpci pkg-config flags are incomplete for $target: $pci_flags"
-    [[ "$openssl_flags" != *"/usr/include"* && "$pci_flags" != *"/usr/include"* ]] || die "pkg-config leaked host include paths for $target"
-
-    # The .pc files are generated by this SDK and use paths without spaces.
-    # Deliberate word splitting converts pkgconf's flags into compiler args.
-    # shellcheck disable=SC2086
-    "$cc" -static "$target_dir/openssl.c" -o "$target_dir/openssl" $openssl_flags
-    # shellcheck disable=SC2086
-    "$cc" -static "$target_dir/pci.c" -o "$target_dir/pci" $pci_flags
-
-    verify_target_elf "$target" "$target_dir/hello-c" "$readelf_tool"
-    verify_target_elf "$target" "$target_dir/hello-cxx" "$readelf_tool"
-    verify_target_elf "$target" "$target_dir/openssl" "$readelf_tool"
-    verify_target_elf "$target" "$target_dir/pci" "$readelf_tool"
+    validate_toolchain_compilation "$sdk_root/$target" "$target" \
+      "$validation_root/$target" "$label"
   done
+
+  if (( validate_standalone )); then
+    for target in "${TARGETS[@]}"; do
+      target_is_selected "$target" || continue
+      validate_independent_toolchain_copy "$sdk_root" "$target" \
+        "$validation_root/standalone-copies" "$label"
+    done
+  fi
 }
 
 verify_archive_layout() {
@@ -1360,6 +1470,9 @@ verify_archive_layout() {
   [[ "$top" == nbl-sdk-* ]] || die "archive root is not nbl-sdk-<version>: $top"
   if tar -tJf "$archive" | grep -Eq '/(stage1|sources|source-cache|\.nbl-sdk-cache)(/|$)'; then
     die 'archive contains a stage-one toolchain, source cache, or build cache'
+  fi
+  if tar -tJf "$archive" | grep -Eq '^nbl-sdk-[^/]+/\.host(/|$)'; then
+    die 'archive contains the removed SDK-root .host directory'
   fi
 }
 
@@ -1379,7 +1492,7 @@ verify_archive() {
   root=$(find "$verify_work" -mindepth 1 -maxdepth 1 -type d -name 'nbl-sdk-*' -print -quit)
   [[ -n "$root" && -f "$root/README.md" && -f "$root/BUILD-MANIFEST.json" && -f "$root/SOURCE-LOCK.json" ]] || die 'archive is missing required SDK root files'
   TARGET_FILTER=
-  validate_sdk "$root" "$verify_work/validation" 'clean archive extraction'
+  validate_sdk "$root" "$verify_work/validation" 'clean archive extraction' 1
   TARGET_FILTER=$saved_filter
   log "archive verification passed: $archive"
 }
@@ -1403,7 +1516,7 @@ make_archive() {
 materialize_selected_sdk() {
   local destination=$1 target sysroot
   rm -rf -- "$destination"
-  mkdir -p "$destination/.host/bin"
+  mkdir -p "$destination"
   ensure_pkgconf_checkpoint
   for target in "${TARGETS[@]}"; do
     target_is_selected "$target" || continue
@@ -1414,9 +1527,10 @@ materialize_selected_sdk() {
     sysroot="$destination/$target/$target"
     cp -a "$CHECKPOINT_ROOT/integrations/$target/openssl/." "$sysroot/"
     cp -a "$CHECKPOINT_ROOT/integrations/$target/pciutils/." "$sysroot/"
+    install_toolchain_pkgconf "$CHECKPOINT_ROOT/host/pkgconf" "$destination/$target"
     write_pkg_config_wrapper "$destination" "$target"
+    write_toolchain_readme "$destination/$target" "$target" "$SDK_VERSION"
   done
-  install -m 0755 "$CHECKPOINT_ROOT/host/pkgconf" "$destination/.host/bin/pkgconf"
   apply_release_profile "$destination"
 }
 
@@ -1433,7 +1547,7 @@ validate_sdk_stage() {
   fi
 
   run_step "validation/${TARGET_FILTER:-all}/original" \
-    validate_sdk "$sdk_root" "$WORK_DIR/validation-original" "$label"
+    validate_sdk "$sdk_root" "$WORK_DIR/validation-original" "$label" 1
   if (( relocate )); then
     relocated="$WORK_DIR/relocated/$(basename -- "$sdk_root")"
     rm -rf -- "$relocated"
