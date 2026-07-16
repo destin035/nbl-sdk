@@ -1329,8 +1329,11 @@ write_validation_sources() {
   local directory=$1
   mkdir -p "$directory"
   printf '%s\n' \
+    '#define _GNU_SOURCE' \
+    '#include <limits.h>' \
     '#include <stdio.h>' \
-    'int main(void) { puts("nbl-sdk"); return 0; }' \
+    '_Static_assert(NAME_MAX == 255, "musl NAME_MAX must come from <limits.h>");' \
+    'int main(void) { char name[NAME_MAX + 1] = { 0 }; puts(name); return 0; }' \
     >"$directory/hello.c"
   printf '%s\n' \
     '#include <iostream>' \

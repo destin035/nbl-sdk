@@ -8,16 +8,16 @@
   },
   "musl_cross_make": {
     "url": "https://github.com/destin035/musl-cross-make.git",
-    "commit": "483e98dc4bb1d9f9c429c8563c280291ad1faec0",
-    "archive_sha256": "79202c0077e4b2a3d651b8986f6d6573702b5b63a63e420a096d43ba97040c85"
+    "commit": "1ec25b0ddb68beb36d2dfc87cf9b0277a637e355",
+    "archive_sha256": "7b0ab2c44719008dd0afdcbafde765da57a88d3cb1215988c636159d7d4b2c80"
   },
   "patches": [
     {
       "name": "musl-cross-make embedded patchset",
       "path": "musl-cross-make/patches",
       "url": "https://github.com/destin035/musl-cross-make.git",
-      "version": "483e98dc4bb1d9f9c429c8563c280291ad1faec0",
-      "sha256": "e42393d6ce94579d77395e16d722092a45aa590306031f6b47208ab11e1107a9"
+      "version": "1ec25b0ddb68beb36d2dfc87cf9b0277a637e355",
+      "sha256": "c5324864e4752e5716a6ccec607cb7967e24835a6eaba8bd3875ca6e2831e2a9"
     }
   ],
   "source_patches": [
