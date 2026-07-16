@@ -29,6 +29,7 @@ CHECKPOINT_KEY=
 CHECKPOINT_ROOT=
 
 readonly CHECKPOINT_SCHEMA=1
+readonly RELEASE_PROFILE=debug-symbols-stripped-v2
 
 log() {
   printf 'nbl-sdk-container: %s\n' "$*" >&2
@@ -69,7 +70,7 @@ EOF
 
 require_commands() {
   local command
-  for command in ar file find git make python3 readelf rsync sha256sum tar xz; do
+  for command in ar file find git make python3 readelf rsync sha256sum stat strip tar xz; do
     command -v "$command" >/dev/null 2>&1 || die "required container command is missing: $command"
   done
 }
@@ -402,6 +403,173 @@ assert_static_tool_tree() {
   done < <(
     find "$root/bin" "$root/libexec" -type f -perm /111 -print0 2>/dev/null || true
   )
+}
+
+is_x86_64_host_elf() {
+  local candidate=$1 machine
+  readelf -h "$candidate" >/dev/null 2>&1 || return 1
+  machine=$(readelf -h "$candidate" 2>/dev/null | awk -F: '
+    $1 ~ /Machine/ {
+      value = $2
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+    }
+    END { print value }
+  ')
+  [[ "$machine" == *X86-64* ]]
+}
+
+release_strip_host_elf_debug_symbols() {
+  local sdk_root=$1 root record inode candidate canonical before after
+  local stripped=0 saved=0 relinked=0
+  local -A canonical_by_inode=()
+  local -A stripped_by_inode=()
+
+  for root in "$sdk_root/.host" "${TARGETS[@]/#/$sdk_root/}"; do
+    [[ -d "$root" ]] || continue
+    case "$root" in
+      "$sdk_root/.host") ;;
+      *)
+        [[ -d "$root/bin" || -d "$root/libexec" ]] || continue
+        ;;
+    esac
+    while IFS= read -r -d '' record; do
+      inode=${record%%$'\t'*}
+      candidate=${record#*$'\t'}
+      if [[ -n ${canonical_by_inode[$inode]+present} ]]; then
+        if [[ -n ${stripped_by_inode[$inode]+present} ]]; then
+          canonical=${canonical_by_inode[$inode]}
+          rm -f -- "$candidate"
+          ln -- "$canonical" "$candidate"
+          relinked=$((relinked + 1))
+        fi
+        continue
+      fi
+      canonical_by_inode[$inode]=$candidate
+      is_x86_64_host_elf "$candidate" || continue
+      before=$(stat -c %s "$candidate")
+      strip --strip-debug "$candidate"
+      after=$(stat -c %s "$candidate")
+      (( after <= before )) || die "debug stripping unexpectedly grew host ELF: $candidate"
+      saved=$((saved + before - after))
+      stripped=$((stripped + 1))
+      stripped_by_inode[$inode]=1
+    done < <(
+      if [[ "$root" == "$sdk_root/.host" ]]; then
+        find "$root" -type f -printf '%D:%i\t%p\0'
+      else
+        find "$root/bin" "$root/libexec" -type f -printf '%D:%i\t%p\0' 2>/dev/null || true
+      fi
+    )
+  done
+  log "release profile $RELEASE_PROFILE: stripped $stripped host ELF files ($saved bytes; restored $relinked hard links)"
+}
+
+release_strip_target_static_archives() {
+  local sdk_root=$1 target=$2 target_root target_strip target_ranlib
+  local record inode candidate canonical before after strip_tool ranlib_tool
+  local stripped=0 saved=0 relinked=0 host_archives=0
+  local -A canonical_by_inode=()
+  local -A stripped_by_inode=()
+
+  target_root="$sdk_root/$target"
+  target_strip="$target_root/bin/$target-strip"
+  target_ranlib="$target_root/bin/$target-ranlib"
+  [[ -x "$target_strip" ]] || die "release profile is missing $target-strip"
+  [[ -x "$target_ranlib" ]] || die "release profile is missing $target-ranlib"
+
+  while IFS= read -r -d '' record; do
+    inode=${record%%$'\t'*}
+    candidate=${record#*$'\t'}
+    if [[ -n ${canonical_by_inode[$inode]+present} ]]; then
+      if [[ -n ${stripped_by_inode[$inode]+present} ]]; then
+        canonical=${canonical_by_inode[$inode]}
+        rm -f -- "$candidate"
+        ln -- "$canonical" "$candidate"
+        relinked=$((relinked + 1))
+      fi
+      continue
+    fi
+    canonical_by_inode[$inode]=$candidate
+    before=$(stat -c %s "$candidate")
+    strip_tool=$target_strip
+    ranlib_tool=$target_ranlib
+    # Binutils installs a small x86_64 host BFD plugin archive below every
+    # cross-toolchain prefix.  A target strip silently leaves it untouched;
+    # detect it from all archive members and use the host binutils instead.
+    if readelf -h "$candidate" 2>/dev/null | awk -F: '
+      $1 ~ /Machine/ {
+        value = $2
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        seen = 1
+        if (value !~ /X86-64/) other = 1
+      }
+      END { exit (seen && !other) ? 0 : 1 }
+    '; then
+      strip_tool=strip
+      ranlib_tool=ranlib
+      host_archives=$((host_archives + 1))
+    fi
+    "$strip_tool" --strip-debug "$candidate"
+    "$ranlib_tool" "$candidate"
+    after=$(stat -c %s "$candidate")
+    (( after <= before )) || die "debug stripping unexpectedly grew static archive: $candidate"
+    saved=$((saved + before - after))
+    stripped=$((stripped + 1))
+    stripped_by_inode[$inode]=1
+  done < <(find "$target_root" -type f -name '*.a' -printf '%D:%i\t%p\0')
+  log "release profile $RELEASE_PROFILE: stripped $stripped static archives for $target ($saved bytes; $host_archives x86_64-handled archives; restored $relinked hard links)"
+}
+
+apply_release_profile() {
+  local sdk_root=$1 target
+  release_strip_host_elf_debug_symbols "$sdk_root"
+  for target in "${TARGETS[@]}"; do
+    target_is_selected "$target" || continue
+    release_strip_target_static_archives "$sdk_root" "$target"
+  done
+}
+
+assert_no_debug_sections() {
+  local reader=$1 candidate=$2
+  "$reader" -SW "$candidate" >/dev/null 2>&1 || die "cannot inspect release artifact for debug sections: $candidate"
+  if "$reader" -SW "$candidate" 2>/dev/null | awk '
+    $2 ~ /^\.(debug|zdebug)/ || $3 ~ /^\.(debug|zdebug)/ { found = 1 }
+    END { exit found ? 0 : 1 }
+  '; then
+    die "release profile left debug sections in: $candidate"
+  fi
+}
+
+assert_release_profile() {
+  local sdk_root=$1 target root candidate reader
+  for root in "$sdk_root/.host" "${TARGETS[@]/#/$sdk_root/}"; do
+    [[ -d "$root" ]] || continue
+    if [[ "$root" != "$sdk_root/.host" ]]; then
+      target=$(basename -- "$root")
+      target_is_selected "$target" || continue
+    fi
+    while IFS= read -r -d '' candidate; do
+      is_x86_64_host_elf "$candidate" || continue
+      assert_no_debug_sections readelf "$candidate"
+    done < <(
+      if [[ "$root" == "$sdk_root/.host" ]]; then
+        find "$root" -type f -print0
+      else
+        find "$root/bin" "$root/libexec" -type f -print0 2>/dev/null || true
+      fi
+    )
+  done
+
+  for target in "${TARGETS[@]}"; do
+    target_is_selected "$target" || continue
+    reader="$sdk_root/$target/bin/$target-readelf"
+    [[ -x "$reader" ]] || die "release profile is missing $target-readelf"
+    while IFS= read -r -d '' candidate; do
+      assert_no_debug_sections "$reader" "$candidate"
+    done < <(find "$sdk_root/$target" -type f -name '*.a' -print0)
+  done
 }
 
 build_mcm_toolchain() {
@@ -889,6 +1057,16 @@ ensure_all_checkpoints() {
 cached_sdk_is_valid() {
   local directory=$1 target sysroot
   [[ -x "$directory/.host/bin/pkgconf" ]] || return 1
+  [[ -r "$directory/BUILD-MANIFEST.json" ]] || return 1
+  python3 - "$directory/BUILD-MANIFEST.json" "$RELEASE_PROFILE" <<'PY' || return 1
+import json
+import pathlib
+import sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+release = manifest.get('release_optimization', {})
+raise SystemExit(0 if release.get('profile') == sys.argv[2] else 1)
+PY
   for target in "${TARGETS[@]}"; do
     sysroot="$directory/$target/$target"
     [[ -x "$directory/$target/bin/$target-gcc" ]] || return 1
@@ -916,6 +1094,9 @@ build_assembled_sdk_once() {
   for target in "${TARGETS[@]}"; do
     write_pkg_config_wrapper "$temporary" "$target"
   done
+  # Checkpoints contain pristine toolchains.  Strip only this materialized
+  # release tree, so retries and targeted diagnostics keep their symbols.
+  apply_release_profile "$temporary"
   write_sdk_readme "$temporary" "$SDK_VERSION"
   write_build_manifest "$temporary" "$SDK_VERSION"
   check_required_layout "$temporary"
@@ -983,6 +1164,10 @@ write_sdk_readme() {
     'zlib, libkmod, and HWDB backends disabled, so this SDK does not need to' \
     'ship zlib as a private libpci dependency.' \
     '' \
+    'Release packaging removes DWARF debug sections from host-side SDK tools' \
+    'and target static archives. This preserves normal compiler and linker' \
+    'functionality while keeping the delivered SDK compact.' \
+    '' \
     'See `BUILD-MANIFEST.json` and `SOURCE-LOCK.json` for exact source,' \
     'patchset, submodule, and container-image provenance.' \
     >"$sdk_root/README.md"
@@ -990,7 +1175,7 @@ write_sdk_readme() {
 
 write_build_manifest() {
   local sdk_root=$1 version=$2
-  python3 - "$LOCK_FILE" "$sdk_root/BUILD-MANIFEST.json" "$version" "${NBL_SDK_BUILDER_IMAGE:-unknown}" <<'PY'
+  python3 - "$LOCK_FILE" "$sdk_root/BUILD-MANIFEST.json" "$version" "${NBL_SDK_BUILDER_IMAGE:-unknown}" "$RELEASE_PROFILE" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -1000,7 +1185,7 @@ lock_path = pathlib.Path(sys.argv[1])
 output_path = pathlib.Path(sys.argv[2])
 lock = json.loads(lock_path.read_text(encoding='utf-8'))
 manifest = {
-    'schema': 1,
+    'schema': 2,
     'sdk_version': sys.argv[3],
     'source_date_epoch': lock['source_date_epoch'],
     'targets': [
@@ -1033,6 +1218,11 @@ manifest = {
             'host_static': True,
             'wrapper_default': '--static',
         },
+    },
+    'release_optimization': {
+        'profile': sys.argv[5],
+        'host_elf_debug_sections': 'stripped',
+        'target_static_archive_debug_sections': 'stripped',
     },
     'source_lock_sha256': hashlib.sha256(lock_path.read_bytes()).hexdigest(),
 }
@@ -1125,6 +1315,7 @@ validate_sdk() {
     target_is_selected "$target" || continue
     assert_static_tool_tree "$sdk_root/$target"
   done
+  assert_release_profile "$sdk_root"
 
   rm -rf -- "$validation_root"
   mkdir -p "$validation_root"
@@ -1226,6 +1417,7 @@ materialize_selected_sdk() {
     write_pkg_config_wrapper "$destination" "$target"
   done
   install -m 0755 "$CHECKPOINT_ROOT/host/pkgconf" "$destination/.host/bin/pkgconf"
+  apply_release_profile "$destination"
 }
 
 validate_sdk_stage() {

@@ -90,6 +90,12 @@ the verified source cache.
 
 The output is `dist/nbl-sdk-<version>.tar.xz` by default. Its root README
 explains direct compiler and pkg-config usage; no activation script is needed.
+Release materialization strips only DWARF debug sections from host-side SDK
+ELF tools and target static archives. Pristine reusable checkpoints retain
+their symbols, while the delivered toolchains, headers, static libraries, and
+pkg-config metadata remain intact. The package verification checks both that
+these sections are absent and that every required static C/C++/OpenSSL/libpci
+link still succeeds.
 
 ## Provenance and reproducibility
 
