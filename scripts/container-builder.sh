@@ -792,7 +792,7 @@ openssl_target_for() {
     aarch64-linux-musl) printf '%s\n' linux-aarch64 ;;
     loongarch64-linux-musl) printf '%s\n' linux64-loongarch64 ;;
     riscv64-linux-musl) printf '%s\n' linux64-riscv64 ;;
-    sw_64-linux-musl) printf '%s\n' linux-generic64 ;;
+    sw_64-linux-musl) printf '%s\n' linux-sw_64 ;;
     x86_64-linux-musl) printf '%s\n' linux-x86_64 ;;
     *) die "unknown OpenSSL target: $1" ;;
   esac
@@ -852,10 +852,14 @@ build_openssl() {
 
   unpack_source openssl "$workspace" "$source_root"
 
-  local -a options=(no-apps no-asm no-dso no-module no-shared no-tests no-zlib)
-  # SW64 intentionally stays on OpenSSL's generic C/no-asm implementation.
-  # no-asm is also used for the other targets to keep the SDK's CPU baseline
-  # entirely under musl-cross-make/GCC rather than OpenSSL per-CPU assembly.
+  local -a options=(no-apps no-dso no-module no-shared no-tests no-zlib)
+  if [[ "$target" != sw_64-linux-musl ]]; then
+    # Keep every other target on OpenSSL's generic C/no-asm implementation so
+    # its CPU baseline remains entirely under musl-cross-make/GCC.
+    options+=(no-asm)
+  fi
+  # The locked OpenSSL patch imports openEuler's SW64 target and its
+  # architecture-specific BN, GHASH, SHA-1, and CPU-support sources.
   log "building static OpenSSL for $target ($config)"
   (
     cd "$source_root"

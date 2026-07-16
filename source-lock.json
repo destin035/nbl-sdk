@@ -20,7 +20,14 @@
       "sha256": "e42393d6ce94579d77395e16d722092a45aa590306031f6b47208ab11e1107a9"
     }
   ],
-  "source_patches": [],
+  "source_patches": [
+    {
+      "source": "openssl",
+      "path": "patches/openssl/3.5.7/0001-openeuler-sw_64-support.patch",
+      "sha256": "bec5669719282b3c906602e547aab2b7822f158e836380656ad36aea1a2702c0",
+      "strip": 1
+    }
+  ],
   "sources": [
     {
       "name": "binutils-common",

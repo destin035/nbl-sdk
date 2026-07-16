@@ -116,7 +116,10 @@ timestamp. Generic patches for directly built components are documented in
 toolchain inputs continue to use the submodule's existing patch mechanism.
 
 The SW64 target uses the existing submodule preset, including its SW8A CPU
-constraint. The builder adds no `-march=native`, host tuning, external RPM,
-precompiled toolchain, or target execution. OpenSSL is static-only; libpci is
-built with DNS, zlib, libkmod, and HWDB backends disabled, so no zlib private
-dependency is needed.
+constraint. Its static OpenSSL build applies the SW64 support work from
+openEuler 24.03 LTS SP4 to the locked 3.5.7 source and selects OpenSSL's
+`linux-sw_64` target, including the BN, GHASH, and SHA-1 assembly sources.
+The builder adds no `-march=native`, host tuning, external RPM, precompiled
+toolchain, or target execution. OpenSSL is static-only; libpci is built with
+DNS, zlib, libkmod, and HWDB backends disabled, so no zlib private dependency
+is needed.
