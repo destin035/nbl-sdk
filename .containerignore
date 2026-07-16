@@ -1,0 +1,6 @@
+.git
+.nbl-sdk-cache
+dist
+musl-cross-make/.git
+__pycache__
+*.pyc

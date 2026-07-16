@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# Thin host-side launcher.  It deliberately does not download, compile, test,
+# or package anything: those operations are delegated to the pinned Podman
+# builder image.
+set -euo pipefail
+
+readonly ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly DEFAULT_CACHE="$ROOT_DIR/.nbl-sdk-cache"
+readonly DEFAULT_OUTPUT="$ROOT_DIR/dist"
+readonly DEFAULT_IMAGE="localhost/nbl-sdk-builder:ubuntu24.04"
+
+die() {
+  printf 'nbl-sdk: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./nbl-sdk image [--image NAME]
+  ./nbl-sdk sources [--offline] [--cache DIR] [--image NAME]
+  ./nbl-sdk toolchains [--version VERSION] [--jobs N] [--target TRIPLET] [--offline] [--cache DIR] [--output DIR] [--image NAME]
+  ./nbl-sdk libraries [--version VERSION] [--jobs N] [--target TRIPLET] [--offline] [--cache DIR] [--output DIR] [--image NAME]
+  ./nbl-sdk assemble [--version VERSION] [--offline] [--cache DIR] [--output DIR] [--image NAME]
+  ./nbl-sdk validate-sdk [--version VERSION] [--target TRIPLET] [--relocate] [--offline] [--cache DIR] [--output DIR] [--image NAME]
+  ./nbl-sdk package [--version VERSION] [--jobs N] [--offline] [--cache DIR] [--output DIR] [--image NAME]
+  ./nbl-sdk build [--version VERSION] [--jobs N] [--target TRIPLET] [--offline] [--cache DIR] [--output DIR] [--image NAME]
+  ./nbl-sdk status [--version VERSION] [--target TRIPLET] [--offline] [--cache DIR] [--output DIR] [--image NAME]
+  ./nbl-sdk verify [--archive PATH] [--version VERSION] [--output DIR] [--offline] [--image NAME]
+  ./nbl-sdk clean [--stages|--all] [--cache DIR] [--output DIR] [--offline] [--image NAME]
+
+The host launcher supports only x86_64 Linux with rootless Podman.  All source
+downloads, compilation, verification, and archive creation run in Podman.
+
+Defaults:
+  version  contents of VERSION
+  cache    .nbl-sdk-cache/       (download cache and reusable checkpoints; retained by clean)
+  output   dist/                 (contains nbl-sdk-<version>.tar.xz)
+  image    localhost/nbl-sdk-builder:ubuntu24.04
+
+--offline never attempts to build/pull an image and makes the container fail
+clearly when a verified source cache entry is missing.
+
+`toolchains`, `libraries`, and `validate-sdk --target` are independently
+rerunnable checkpoints. `build --target TRIPLET` completes just that target's
+toolchain/library checkpoints and deliberately does not create a partial SDK
+archive. `status` reports the checkpoint and per-step log paths.
+EOF
+}
+
+require_host() {
+  [[ "$(uname -s)" == "Linux" ]] || die 'only Linux hosts are supported'
+  [[ "$(uname -m)" == "x86_64" ]] || die 'only x86_64 hosts are supported; no emulation is provided'
+  command -v podman >/dev/null 2>&1 || die 'Podman is required'
+
+  local rootless
+  rootless=$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)
+  [[ "$rootless" == "true" ]] || die 'rootless Podman is required (podman info did not report Rootless=true)'
+}
+
+absolute_path() {
+  local path=$1
+  case "$path" in
+    /*) printf '%s\n' "$path" ;;
+    *) printf '%s/%s\n' "$(pwd -P)" "$path" ;;
+  esac
+}
+
+read_default_version() {
+  [[ -r "$ROOT_DIR/VERSION" ]] || die 'VERSION is missing'
+  local version
+  version=$(tr -d '[:space:]' <"$ROOT_DIR/VERSION")
+  [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid VERSION: $version"
+  printf '%s\n' "$version"
+}
+
+ensure_image() {
+  local image=$1 offline=$2
+  if (( offline )); then
+    podman image exists "$image" || die "offline mode requires an existing builder image: $image"
+    return
+  fi
+  podman build --file "$ROOT_DIR/Containerfile" --tag "$image" "$ROOT_DIR"
+}
+
+run_builder() {
+  local image=$1 cache=$2 output=$3
+  shift 3
+  mkdir -p "$cache" "$output"
+  podman run --rm \
+    --userns=keep-id \
+    --security-opt label=disable \
+    --volume "$ROOT_DIR:/src:ro" \
+    --volume "$cache:/cache" \
+    --volume "$output:/out" \
+    --env NBL_SDK_BUILDER_IMAGE="$image" \
+    "$image" "$@"
+}
+
+run_archive_verifier() {
+  local image=$1 archive=$2
+  local archive_dir archive_name
+  archive_dir=$(CDPATH= cd -- "$(dirname -- "$archive")" && pwd -P)
+  archive_name=$(basename -- "$archive")
+  podman run --rm \
+    --userns=keep-id \
+    --security-opt label=disable \
+    --volume "$ROOT_DIR:/src:ro" \
+    --volume "$archive_dir:/input:ro" \
+    --env NBL_SDK_BUILDER_IMAGE="$image" \
+    "$image" verify-archive "/input/$archive_name"
+}
+
+main() {
+  local command=${1:-help}
+  if [[ $# -gt 0 ]]; then
+    shift
+  fi
+
+  local version cache output image archive target
+  local offline=0 jobs clean_all=0 clean_stages=0 relocate=0
+  version=$(read_default_version)
+  cache=${NBL_SDK_CACHE:-$DEFAULT_CACHE}
+  output=${NBL_SDK_OUTPUT:-$DEFAULT_OUTPUT}
+  image=${NBL_SDK_IMAGE:-$DEFAULT_IMAGE}
+  archive=
+  target=
+  jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --version)
+        [[ $# -ge 2 ]] || die '--version needs an argument'
+        version=$2
+        shift 2
+        ;;
+      --cache)
+        [[ $# -ge 2 ]] || die '--cache needs an argument'
+        cache=$2
+        shift 2
+        ;;
+      --output)
+        [[ $# -ge 2 ]] || die '--output needs an argument'
+        output=$2
+        shift 2
+        ;;
+      --image)
+        [[ $# -ge 2 ]] || die '--image needs an argument'
+        image=$2
+        shift 2
+        ;;
+      --archive)
+        [[ $# -ge 2 ]] || die '--archive needs an argument'
+        archive=$2
+        shift 2
+        ;;
+      --target)
+        [[ $# -ge 2 ]] || die '--target needs an argument'
+        target=$2
+        shift 2
+        ;;
+      --relocate)
+        relocate=1
+        shift
+        ;;
+      --jobs)
+        [[ $# -ge 2 ]] || die '--jobs needs an argument'
+        jobs=$2
+        shift 2
+        ;;
+      --offline)
+        offline=1
+        shift
+        ;;
+      --all)
+        clean_all=1
+        shift
+        ;;
+      --stages)
+        clean_stages=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        return
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+  done
+
+  [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid version: $version"
+  [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "--jobs must be a positive integer"
+  cache=$(absolute_path "$cache")
+  output=$(absolute_path "$output")
+
+  case "$command" in
+    help|-h|--help)
+      usage
+      ;;
+    image)
+      require_host
+      (( offline == 0 )) || die '--offline cannot build an image'
+      podman build --file "$ROOT_DIR/Containerfile" --tag "$image" "$ROOT_DIR"
+      ;;
+    sources)
+      require_host
+      ensure_image "$image" "$offline"
+      if (( offline )); then
+        run_builder "$image" "$cache" "$output" fetch-sources --offline
+      else
+        run_builder "$image" "$cache" "$output" fetch-sources
+      fi
+      ;;
+    toolchains|libraries|assemble|validate-sdk|package|build|status)
+      require_host
+      ensure_image "$image" "$offline"
+      local -a builder_args=("$command" --version "$version" --jobs "$jobs")
+      if [[ -n "$target" ]]; then
+        builder_args+=(--target "$target")
+      fi
+      if (( relocate )); then
+        builder_args+=(--relocate)
+      fi
+      if (( offline )); then
+        builder_args+=(--offline)
+      fi
+      run_builder "$image" "$cache" "$output" "${builder_args[@]}"
+      ;;
+    verify)
+      require_host
+      ensure_image "$image" "$offline"
+      if [[ -z "$archive" ]]; then
+        archive="$output/nbl-sdk-$version.tar.xz"
+      fi
+      archive=$(absolute_path "$archive")
+      [[ -f "$archive" ]] || die "archive does not exist: $archive"
+      run_archive_verifier "$image" "$archive"
+      ;;
+    clean)
+      require_host
+      ensure_image "$image" "$offline"
+      if (( clean_all )); then
+        run_builder "$image" "$cache" "$output" clean --all
+      elif (( clean_stages )); then
+        run_builder "$image" "$cache" "$output" clean --stages
+      else
+        run_builder "$image" "$cache" "$output" clean
+      fi
+      ;;
+    *)
+      usage >&2
+      die "unknown command: $command"
+      ;;
+  esac
+}
+
+main "$@"
