@@ -11,7 +11,7 @@ x86_64 Linux host. The delivered SDK contains cross toolchains for:
 
 Each `<triplet>/` directory is a complete standalone toolchain unit. Copy the
 whole directory—rather than only `bin/`—to any location on an x86_64 Linux
-host (and optionally rename it); its compiler, sysroot, OpenSSL/libpci
+host (and optionally rename it); its compiler, sysroot, OpenSSL/libpci/ncurses
 integration, and static `libexec/pkgconf` remain usable without the rest of
 the SDK.
 
@@ -37,7 +37,7 @@ commit and patchset before use.
 # Run only the reusable toolchain checkpoint for one target.
 ./nbl-sdk toolchains --target aarch64-linux-musl
 
-# Build/retry only static OpenSSL and libpci for that target.
+# Build/retry only static OpenSSL, libpci, and ncurses for that target.
 ./nbl-sdk libraries --target aarch64-linux-musl
 
 # Materialize the cached complete SDK without creating an archive.
@@ -78,7 +78,7 @@ The cache contains three distinct classes of data:
 
 - `sources/`: verified upstream downloads;
 - `checkpoints/<key>/`: static stage-one host tools, each final toolchain,
-  static `pkgconf`, and separate OpenSSL/libpci overlays per target;
+  static `pkgconf`, and separate OpenSSL/libpci/ncurses overlays per target;
 - `checkpoints/<key>/logs/`: one log per stage, such as
   `toolchains/sw_64-linux-musl.log` or
   `libraries/aarch64-linux-musl/openssl.log`.
@@ -98,13 +98,13 @@ the verified source cache.
 The output is `dist/nbl-sdk-<version>.tar.xz` by default. No activation script
 is needed. The package verifier extracts the archive, copies each target
 directory alone to a renamed location, and verifies static
-C/C++/OpenSSL/libpci links from that isolated copy.
+C/C++/OpenSSL/libpci/ncurses links from that isolated copy.
 Release materialization strips only DWARF debug sections from host-side SDK
 ELF tools and target static archives. Pristine reusable checkpoints retain
 their symbols, while the delivered toolchains, headers, static libraries, and
 pkg-config metadata remain intact. The package verification checks both that
-these sections are absent and that every required static C/C++/OpenSSL/libpci
-link still succeeds.
+these sections are absent and that every required static C/C++/OpenSSL/libpci/
+ncurses link still succeeds.
 
 ## Provenance and reproducibility
 
@@ -120,6 +120,8 @@ constraint. Its static OpenSSL build applies the SW64 support work from
 openEuler 24.03 LTS SP4 to the locked 3.5.7 source and selects OpenSSL's
 `linux-sw_64` target, including the BN, GHASH, and SHA-1 assembly sources.
 The builder adds no `-march=native`, host tuning, external RPM, precompiled
-toolchain, or target execution. OpenSSL is static-only; libpci is built with
-DNS, zlib, libkmod, and HWDB backends disabled, so no zlib private dependency
-is needed.
+toolchain, or target execution. OpenSSL, libpci, and ncurses are static-only.
+ncurses is built as the conventional non-wide `libncurses.a`/`libtinfo.a` pair
+with pkg-config metadata; terminal descriptions remain target runtime assets.
+libpci is built with DNS, zlib, libkmod, and HWDB backends disabled, so no zlib
+private dependency is needed.

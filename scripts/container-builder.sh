@@ -22,6 +22,7 @@ readonly -a TARGETS=(
 # These sources are unpacked and built by this builder.  Toolchain inputs are
 # intentionally absent: musl-cross-make owns their extraction and patching.
 readonly -a DIRECT_PATCH_SOURCES=(
+  ncurses
   openssl
   pciutils
   pkgconf
@@ -924,6 +925,58 @@ build_pciutils() {
   fi
 }
 
+build_ncurses() {
+  local workspace=$1 toolchain_root=$2 target=$3 install_root=$4
+  local source_root="$workspace/ncurses-$target"
+  local ncurses_version
+  ncurses_version=$(source_version ncurses)
+
+  rm -rf -- "$install_root"
+  mkdir -p "$install_root"
+  unpack_source ncurses "$workspace" "$source_root"
+
+  # Build the normal (non-wide) static libraries so the SDK provides the
+  # conventional libncurses.a and ncurses.pc names.  Build only library and
+  # header targets: terminal descriptions and target-side helper programs are
+  # runtime assets, not SDK dependencies.
+  log "building static ncurses $ncurses_version for $target"
+  (
+    cd "$source_root"
+    export PATH="$toolchain_root/bin:$PATH"
+    env \
+      AR="$target-ar" \
+      CC="$target-gcc" \
+      RANLIB="$target-ranlib" \
+      ./configure \
+        --host="$target" \
+        --prefix=/ \
+        --libdir=/lib \
+        --includedir=/include \
+        --without-ada \
+        --without-cxx \
+        --without-debug \
+        --without-manpages \
+        --without-progs \
+        --without-shared \
+        --without-tests \
+        --disable-widec \
+        --with-normal \
+        --with-termlib \
+        --enable-pc-files \
+        --with-pkg-config-libdir=/lib/pkgconfig
+    make "-j$JOBS" libs
+    make DESTDIR="$install_root" install.libs install.includes
+  )
+
+  [[ -f "$install_root/include/ncurses.h" ]] || die "ncurses headers missing for $target"
+  [[ -f "$install_root/lib/libncurses.a" ]] || die "libncurses.a missing for $target"
+  [[ -f "$install_root/lib/libtinfo.a" ]] || die "libtinfo.a missing for $target"
+  [[ -f "$install_root/lib/pkgconfig/ncurses.pc" ]] || die "ncurses.pc missing for $target"
+  if find "$install_root/lib" -maxdepth 1 -type f \( -name 'libncurses.so*' -o -name 'libtinfo.so*' \) -print -quit | grep -q .; then
+    die "ncurses installed a shared library for $target"
+  fi
+}
+
 build_pkgconf() {
   local workspace=$1 output_root=$2 stage_one=$3
   local source_root install_root cc
@@ -1030,6 +1083,14 @@ cached_pciutils_overlay_is_valid() {
     [[ -f "$directory/lib/pkgconfig/libpci.pc" ]]
 }
 
+cached_ncurses_overlay_is_valid() {
+  local directory=$1
+  [[ -f "$directory/include/ncurses.h" ]] &&
+    [[ -f "$directory/lib/libncurses.a" ]] &&
+    [[ -f "$directory/lib/libtinfo.a" ]] &&
+    [[ -f "$directory/lib/pkgconfig/ncurses.pc" ]]
+}
+
 build_final_toolchain_once() {
   local work_mcm=$1 target=$2 output=$3 stage_one=$4 preset
   preset=$(preset_for_target "$target")
@@ -1125,6 +1186,15 @@ capture_pciutils_overlay() {
   cp -a "$sysroot/lib/pkgconfig/libpci.pc" "$overlay/lib/pkgconfig/"
 }
 
+capture_ncurses_overlay() {
+  local install_root=$1 overlay=$2
+  [[ -d "$install_root/include" ]] || die "ncurses install headers are missing: $install_root"
+  [[ -d "$install_root/lib" ]] || die "ncurses install libraries are missing: $install_root"
+  mkdir -p "$overlay"
+  cp -a "$install_root/include" "$overlay/"
+  cp -a "$install_root/lib" "$overlay/"
+}
+
 build_openssl_overlay_once() {
   local target=$1 overlay=$2 scratch
   local sysroot
@@ -1149,6 +1219,18 @@ build_pciutils_overlay_once() {
   sysroot="$scratch/$target/$target"
   capture_pciutils_overlay "$sysroot" "$overlay"
   cached_pciutils_overlay_is_valid "$overlay" || die "pciutils checkpoint is incomplete for $target"
+}
+
+build_ncurses_overlay_once() {
+  local target=$1 overlay=$2 scratch install_root
+  scratch="$WORK_DIR/ncurses-$target-sdk"
+  install_root="$scratch/install"
+  rm -rf -- "$scratch" "$overlay"
+  mkdir -p "$scratch/work" "$overlay"
+  cp -a "$CHECKPOINT_ROOT/toolchains/$target" "$scratch/$target"
+  build_ncurses "$scratch/work" "$scratch/$target" "$target" "$install_root"
+  capture_ncurses_overlay "$install_root" "$overlay"
+  cached_ncurses_overlay_is_valid "$overlay" || die "ncurses checkpoint is incomplete for $target"
 }
 
 ensure_openssl_checkpoint() {
@@ -1187,6 +1269,24 @@ ensure_pciutils_checkpoint() {
   commit_checkpoint_dir "$temporary" "$destination"
 }
 
+ensure_ncurses_checkpoint() {
+  local target=$1 destination
+  destination="$CHECKPOINT_ROOT/integrations/$target/ncurses"
+  if cached_ncurses_overlay_is_valid "$destination"; then
+    log "checkpoint reuse: ncurses $target"
+    return
+  fi
+
+  ensure_toolchain_checkpoint "$target"
+  ensure_work_dir
+  local temporary="$CHECKPOINT_ROOT/.tmp/ncurses-$target.$$"
+  rm -rf -- "$temporary"
+  mkdir -p "$temporary"
+  run_step "libraries/$target/ncurses" build_ncurses_overlay_once "$target" "$temporary"
+  mkdir -p "$(dirname -- "$destination")"
+  commit_checkpoint_dir "$temporary" "$destination"
+}
+
 build_toolchain_stage() {
   local target
   for target in "${TARGETS[@]}"; do
@@ -1202,6 +1302,7 @@ build_library_stage() {
     target_is_selected "$target" || continue
     ensure_openssl_checkpoint "$target"
     ensure_pciutils_checkpoint "$target"
+    ensure_ncurses_checkpoint "$target"
   done
 }
 
@@ -1215,6 +1316,7 @@ ensure_all_checkpoints() {
   for target in "${TARGETS[@]}"; do
     ensure_openssl_checkpoint "$target"
     ensure_pciutils_checkpoint "$target"
+    ensure_ncurses_checkpoint "$target"
   done
   TARGET_FILTER=$saved_filter
 }
@@ -1230,6 +1332,7 @@ cached_sdk_is_valid() {
     [[ -f "$sysroot/lib/libssl.a" ]] || return 1
     [[ -f "$sysroot/lib/libcrypto.a" ]] || return 1
     [[ -f "$sysroot/lib/libpci.a" ]] || return 1
+    [[ -f "$sysroot/lib/libncurses.a" ]] || return 1
   done
   return 0
 }
@@ -1244,6 +1347,7 @@ build_assembled_sdk_once() {
     sysroot="$temporary/$target/$target"
     cp -a "$CHECKPOINT_ROOT/integrations/$target/openssl/." "$sysroot/"
     cp -a "$CHECKPOINT_ROOT/integrations/$target/pciutils/." "$sysroot/"
+    cp -a "$CHECKPOINT_ROOT/integrations/$target/ncurses/." "$sysroot/"
     install_toolchain_pkgconf "$CHECKPOINT_ROOT/host/pkgconf" "$temporary/$target"
     write_pkg_config_wrapper "$temporary" "$target"
   done
@@ -1285,10 +1389,14 @@ check_required_toolchain_layout() {
   [[ -f "$sysroot/lib/libssl.a" ]] || die "missing libssl.a for $target"
   [[ -f "$sysroot/lib/libcrypto.a" ]] || die "missing libcrypto.a for $target"
   [[ -f "$sysroot/lib/libpci.a" ]] || die "missing libpci.a for $target"
+  [[ -f "$sysroot/lib/libncurses.a" ]] || die "missing libncurses.a for $target"
+  [[ -f "$sysroot/lib/libtinfo.a" ]] || die "missing libtinfo.a for $target"
   [[ -f "$sysroot/include/openssl/evp.h" ]] || die "missing OpenSSL headers for $target"
   [[ -f "$sysroot/include/pci/pci.h" ]] || die "missing pciutils headers for $target"
+  [[ -f "$sysroot/include/ncurses.h" ]] || die "missing ncurses headers for $target"
   [[ -f "$sysroot/lib/pkgconfig/openssl.pc" ]] || die "missing openssl.pc for $target"
   [[ -f "$sysroot/lib/pkgconfig/libpci.pc" ]] || die "missing libpci.pc for $target"
+  [[ -f "$sysroot/lib/pkgconfig/ncurses.pc" ]] || die "missing ncurses.pc for $target"
 }
 
 check_required_layout() {
@@ -1352,11 +1460,15 @@ write_validation_sources() {
     '  return 0;' \
     '}' \
     >"$directory/pci.c"
+  printf '%s\n' \
+    '#include <ncurses.h>' \
+    'int main(void) { return initscr() == 0; }' \
+    >"$directory/ncurses.c"
 }
 
 validate_toolchain_compilation() {
   local toolchain_root=$1 target=$2 validation_root=$3 label=$4
-  local cc cxx pkg readelf_tool openssl_flags pci_flags
+  local cc cxx pkg readelf_tool openssl_flags pci_flags ncurses_flags
   log "validating toolchain compilation ($label): $toolchain_root"
   rm -rf -- "$validation_root"
   mkdir -p "$validation_root"
@@ -1371,9 +1483,11 @@ validate_toolchain_compilation() {
 
   openssl_flags=$("$pkg" --cflags --libs openssl)
   pci_flags=$("$pkg" --cflags --libs libpci)
+  ncurses_flags=$("$pkg" --cflags --libs ncurses)
   [[ "$openssl_flags" == *-lssl* && "$openssl_flags" == *-lcrypto* ]] || die "OpenSSL pkg-config flags are incomplete for $target: $openssl_flags"
   [[ "$pci_flags" == *-lpci* ]] || die "libpci pkg-config flags are incomplete for $target: $pci_flags"
-  [[ "$openssl_flags" != *"/usr/include"* && "$pci_flags" != *"/usr/include"* ]] || die "pkg-config leaked host include paths for $target"
+  [[ "$ncurses_flags" == *-lncurses* && "$ncurses_flags" == *-ltinfo* ]] || die "ncurses pkg-config flags are incomplete for $target: $ncurses_flags"
+  [[ "$openssl_flags" != *"/usr/include"* && "$pci_flags" != *"/usr/include"* && "$ncurses_flags" != *"/usr/include"* ]] || die "pkg-config leaked host include paths for $target"
 
   # The .pc files are generated by this SDK and use paths without spaces.
   # Deliberate word splitting converts pkgconf's flags into compiler args.
@@ -1381,11 +1495,14 @@ validate_toolchain_compilation() {
   "$cc" -static "$validation_root/openssl.c" -o "$validation_root/openssl" $openssl_flags
   # shellcheck disable=SC2086
   "$cc" -static "$validation_root/pci.c" -o "$validation_root/pci" $pci_flags
+  # shellcheck disable=SC2086
+  "$cc" -static "$validation_root/ncurses.c" -o "$validation_root/ncurses" $ncurses_flags
 
   verify_target_elf "$target" "$validation_root/hello-c" "$readelf_tool"
   verify_target_elf "$target" "$validation_root/hello-cxx" "$readelf_tool"
   verify_target_elf "$target" "$validation_root/openssl" "$readelf_tool"
   verify_target_elf "$target" "$validation_root/pci" "$readelf_tool"
+  verify_target_elf "$target" "$validation_root/ncurses" "$readelf_tool"
 }
 
 validate_standalone_toolchain() {
@@ -1501,10 +1618,12 @@ materialize_selected_sdk() {
     ensure_toolchain_checkpoint "$target"
     ensure_openssl_checkpoint "$target"
     ensure_pciutils_checkpoint "$target"
+    ensure_ncurses_checkpoint "$target"
     cp -a "$CHECKPOINT_ROOT/toolchains/$target" "$destination/$target"
     sysroot="$destination/$target/$target"
     cp -a "$CHECKPOINT_ROOT/integrations/$target/openssl/." "$sysroot/"
     cp -a "$CHECKPOINT_ROOT/integrations/$target/pciutils/." "$sysroot/"
+    cp -a "$CHECKPOINT_ROOT/integrations/$target/ncurses/." "$sysroot/"
     install_toolchain_pkgconf "$CHECKPOINT_ROOT/host/pkgconf" "$destination/$target"
     write_pkg_config_wrapper "$destination" "$target"
   done
@@ -1608,6 +1727,11 @@ checkpoint_status() {
       printf 'pciutils[%s]=ready\n' "$target"
     else
       printf 'pciutils[%s]=missing\n' "$target"
+    fi
+    if cached_ncurses_overlay_is_valid "$CHECKPOINT_ROOT/integrations/$target/ncurses"; then
+      printf 'ncurses[%s]=ready\n' "$target"
+    else
+      printf 'ncurses[%s]=missing\n' "$target"
     fi
   done
   sdk_root="$CHECKPOINT_ROOT/sdk/nbl-sdk-$SDK_VERSION"

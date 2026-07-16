@@ -26,6 +26,12 @@
       "path": "patches/openssl/3.5.7/0001-openeuler-sw_64-support.patch",
       "sha256": "bec5669719282b3c906602e547aab2b7822f158e836380656ad36aea1a2702c0",
       "strip": 1
+    },
+    {
+      "source": "ncurses",
+      "path": "patches/ncurses/6.5/0001-config-recognize-sw_64-linux.patch",
+      "sha256": "97c73f9bad7ea717a47e2a3fb7e518dc85fa1796c625591a4006b6faf01d7764",
+      "strip": 1
     }
   ],
   "sources": [
@@ -119,6 +125,16 @@
         "https://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.sub;hb=3d5db9ebe860"
       ],
       "sha256": "75d5d255a2a273b6e651f82eecfabf6cbcd8eaeae70e86b417384c8f4a58d8d3"
+    },
+    {
+      "name": "ncurses",
+      "file": "ncurses-6.5.tar.gz",
+      "version": "6.5",
+      "urls": [
+        "https://invisible-island.net/archives/ncurses/ncurses-6.5.tar.gz",
+        "https://invisible-mirror.net/archives/ncurses/ncurses-6.5.tar.gz"
+      ],
+      "sha256": "136d91bc269a9a5785e5f9e980bc76ab57428f604ce3e5a5a90cebc767971cc6"
     },
     {
       "name": "openssl",
