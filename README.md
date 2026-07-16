@@ -15,9 +15,6 @@ host (and optionally rename it); its compiler, sysroot, OpenSSL/libpci
 integration, and static `libexec/pkgconf` remain usable without the rest of
 the SDK.
 
-The delivered SDK root has no `.host/` directory: each target owns its static
-`pkgconf` at `<triplet>/libexec/pkgconf`.
-
 The host entrypoint only checks arguments and rootless Podman, builds or uses
 the pinned builder image, and mounts the cache and artifact directories. Every
 source download, compilation, validation step, and archive operation happens
@@ -98,11 +95,10 @@ tree or archive. `clean` retains both source and checkpoint caches; use
 `clean --stages` to remove checkpoints or `clean --all` to remove both them and
 the verified source cache.
 
-The output is `dist/nbl-sdk-<version>.tar.xz` by default. It contains only the
-toolchain payload; no SDK-specific README, manifest, or source-lock files are
-added. No activation script is needed. The package verifier extracts the
-archive, copies each target directory alone to a renamed location, and verifies
-static C/C++/OpenSSL/libpci links from that isolated copy.
+The output is `dist/nbl-sdk-<version>.tar.xz` by default. No activation script
+is needed. The package verifier extracts the archive, copies each target
+directory alone to a renamed location, and verifies static
+C/C++/OpenSSL/libpci links from that isolated copy.
 Release materialization strips only DWARF debug sections from host-side SDK
 ELF tools and target static archives. Pristine reusable checkpoints retain
 their symbols, while the delivered toolchains, headers, static libraries, and
@@ -114,8 +110,7 @@ link still succeeds.
 
 [`source-lock.json`](source-lock.json) is machine readable and locks the
 container base digest, `musl-cross-make` commit and embedded patchset, every
-source URL/version/SHA-256, and the archive timestamp. It is a build-time
-input and is not copied into the generated SDK.
+source URL/version/SHA-256, and the archive timestamp.
 
 The SW64 target uses the existing submodule preset, including its SW8A CPU
 constraint. The builder adds no `-march=native`, host tuning, external RPM,

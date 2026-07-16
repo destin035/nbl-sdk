@@ -29,7 +29,6 @@ CHECKPOINT_KEY=
 CHECKPOINT_ROOT=
 
 readonly CHECKPOINT_SCHEMA=1
-readonly RELEASE_PROFILE=debug-symbols-stripped-v2
 
 log() {
   printf 'nbl-sdk-container: %s\n' "$*" >&2
@@ -144,9 +143,8 @@ ensure_work_dir() {
 init_checkpoint() {
   [[ -n "$SDK_VERSION" ]] || die 'a checkpointed command needs --version'
 
-  local lock_sha builder_sha computed_key compatible_root
+  local lock_sha computed_key compatible_root
   lock_sha=$(sha256sum "$LOCK_FILE" | awk '{print $1}')
-  builder_sha=$(sha256sum "$0" | awk '{print $1}')
   computed_key=$(printf '%s\n' \
     "schema=$CHECKPOINT_SCHEMA" \
     "source-lock=$lock_sha" \
@@ -185,7 +183,7 @@ PY
   mkdir -p "$CHECKPOINT_ROOT" "$CHECKPOINT_ROOT/logs" "$CHECKPOINT_ROOT/.tmp"
 
   if [[ ! -f "$CHECKPOINT_ROOT/STATE.json" ]]; then
-    python3 - "$CHECKPOINT_ROOT/STATE.json" "$CHECKPOINT_KEY" "$SDK_VERSION" "$lock_sha" "$builder_sha" "$MCM_COMMIT" <<'PY'
+    python3 - "$CHECKPOINT_ROOT/STATE.json" "$CHECKPOINT_KEY" "$SDK_VERSION" "$lock_sha" "$MCM_COMMIT" <<'PY'
 import json
 import pathlib
 import sys
@@ -195,8 +193,7 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
     'checkpoint_key': sys.argv[2],
     'sdk_version': sys.argv[3],
     'source_lock_sha256': sys.argv[4],
-    'builder_sha256': sys.argv[5],
-    'musl_cross_make_commit': sys.argv[6],
+    'musl_cross_make_commit': sys.argv[5],
 }, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 PY
   fi
@@ -454,7 +451,7 @@ release_strip_host_elf_debug_symbols() {
       find "$root/bin" "$root/libexec" -type f -printf '%D:%i\t%p\0' 2>/dev/null || true
     )
   done
-  log "release profile $RELEASE_PROFILE: stripped $stripped host ELF files ($saved bytes; restored $relinked hard links)"
+  log "stripped $stripped host ELF files ($saved bytes; restored $relinked hard links)"
 }
 
 release_strip_target_static_archives() {
@@ -511,7 +508,7 @@ release_strip_target_static_archives() {
     stripped=$((stripped + 1))
     stripped_by_inode[$inode]=1
   done < <(find "$target_root" -type f -name '*.a' -printf '%D:%i\t%p\0')
-  log "release profile $RELEASE_PROFILE: stripped $stripped static archives for $target ($saved bytes; $host_archives x86_64-handled archives; restored $relinked hard links)"
+  log "stripped $stripped static archives for $target ($saved bytes; $host_archives x86_64-handled archives; restored $relinked hard links)"
 }
 
 apply_release_profile() {
@@ -1063,17 +1060,11 @@ ensure_all_checkpoints() {
 
 cached_sdk_is_valid() {
   local directory=$1 target sysroot
-  [[ ! -e "$directory/.host" && ! -L "$directory/.host" ]] || return 1
-  [[ ! -e "$directory/README.md" && ! -L "$directory/README.md" ]] || return 1
-  [[ ! -e "$directory/BUILD-MANIFEST.json" && ! -L "$directory/BUILD-MANIFEST.json" ]] || return 1
-  [[ ! -e "$directory/SOURCE-LOCK.json" && ! -L "$directory/SOURCE-LOCK.json" ]] || return 1
   for target in "${TARGETS[@]}"; do
     sysroot="$directory/$target/$target"
-    [[ ! -e "$directory/$target/README.md" && ! -L "$directory/$target/README.md" ]] || return 1
     [[ -x "$directory/$target/bin/$target-gcc" ]] || return 1
     [[ -x "$directory/$target/bin/$target-g++" ]] || return 1
     [[ -x "$directory/$target/bin/$target-pkg-config" ]] || return 1
-    [[ ! -e "$directory/$target/bin/pkgconf" && ! -L "$directory/$target/bin/pkgconf" ]] || return 1
     [[ -x "$directory/$target/libexec/pkgconf" ]] || return 1
     [[ -f "$sysroot/lib/libssl.a" ]] || return 1
     [[ -f "$sysroot/lib/libcrypto.a" ]] || return 1
@@ -1122,7 +1113,6 @@ assemble_sdk_checkpoint() {
 check_required_toolchain_layout() {
   local toolchain_root=$1 target=$2 sysroot tool
   [[ -d "$toolchain_root" ]] || die "toolchain directory is missing: $toolchain_root"
-  [[ ! -e "$toolchain_root/bin/pkgconf" && ! -L "$toolchain_root/bin/pkgconf" ]] || die "pkgconf must reside in libexec for $target"
   [[ -x "$toolchain_root/libexec/pkgconf" ]] || die "toolchain-local static pkgconf is missing for $target"
   sysroot="$toolchain_root/$target"
   for tool in gcc g++ ar ld pkg-config; do
@@ -1142,7 +1132,6 @@ check_required_toolchain_layout() {
 
 check_required_layout() {
   local sdk_root=$1 target
-  [[ ! -e "$sdk_root/.host" && ! -L "$sdk_root/.host" ]] || die 'delivered SDK must not contain .host'
   for target in "${TARGETS[@]}"; do
     target_is_selected "$target" || continue
     check_required_toolchain_layout "$sdk_root/$target" "$target"
@@ -1298,12 +1287,6 @@ verify_archive_layout() {
   # make tar report SIGPIPE instead of allowing the match to be observed.
   if tar -tJf "$archive" | grep -E '/(stage1|sources|source-cache|\.nbl-sdk-cache)(/|$)' >/dev/null; then
     die 'archive contains a stage-one toolchain, source cache, or build cache'
-  fi
-  if tar -tJf "$archive" | grep -E '^nbl-sdk-[^/]+/\.host(/|$)' >/dev/null; then
-    die 'archive contains the removed SDK-root .host directory'
-  fi
-  if tar -tJf "$archive" | grep -E '^nbl-sdk-[^/]+/(README\.md|BUILD-MANIFEST\.json|SOURCE-LOCK\.json|[^/]+/README\.md)$' >/dev/null; then
-    die 'archive contains generated documentation or provenance metadata'
   fi
 }
 
