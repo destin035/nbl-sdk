@@ -11,12 +11,20 @@ readonly CACHE_ROOT=/cache
 readonly OUT_ROOT=/out
 readonly LOCK_FILE="$SRC_ROOT/source-lock.json"
 readonly MCM_DIR="$SRC_ROOT/musl-cross-make"
+readonly PATCH_ROOT="$SRC_ROOT/patches"
 readonly -a TARGETS=(
   aarch64-linux-musl
   loongarch64-linux-musl
   riscv64-linux-musl
   sw_64-linux-musl
   x86_64-linux-musl
+)
+# These sources are unpacked and built by this builder.  Toolchain inputs are
+# intentionally absent: musl-cross-make owns their extraction and patching.
+readonly -a DIRECT_PATCH_SOURCES=(
+  openssl
+  pciutils
+  pkgconf
 )
 
 WORK_DIR=
@@ -69,7 +77,7 @@ EOF
 
 require_commands() {
   local command
-  for command in ar file find git make python3 readelf rsync sha256sum stat strip tar xz; do
+  for command in ar file find git make patch python3 readelf rsync sha256sum stat strip tar xz; do
     command -v "$command" >/dev/null 2>&1 || die "required container command is missing: $command"
   done
 }
@@ -90,20 +98,175 @@ print(value)
 PY
 }
 
-source_version() {
-  local name=$1
-  python3 - "$LOCK_FILE" "$name" <<'PY'
+source_scalar() {
+  local name=$1 field=$2
+  python3 - "$LOCK_FILE" "$name" "$field" <<'PY'
 import json
 import sys
 
 data = json.load(open(sys.argv[1], encoding='utf-8'))
 for source in data['sources']:
     if source['name'] == sys.argv[2]:
-        print(source['version'])
+        value = source[sys.argv[3]]
+        if not isinstance(value, str):
+            raise SystemExit(
+                f"source field is not a string: {sys.argv[2]}.{sys.argv[3]}"
+            )
+        print(value)
         break
 else:
     raise SystemExit('source not present in lock: ' + sys.argv[2])
 PY
+}
+
+source_version() {
+  source_scalar "$1" version
+}
+
+source_file() {
+  source_scalar "$1" file
+}
+
+validate_source_patches() {
+  python3 - "$LOCK_FILE" "$SRC_ROOT" "${DIRECT_PATCH_SOURCES[@]}" <<'PY'
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+lock_path = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[2]).resolve()
+direct_sources = set(sys.argv[3:])
+data = json.loads(lock_path.read_text(encoding='utf-8'))
+patches = data.get('source_patches', [])
+
+if not isinstance(patches, list):
+    raise SystemExit('source_patches must be an array')
+
+source_names = {
+    source.get('name')
+    for source in data.get('sources', [])
+    if isinstance(source, dict) and isinstance(source.get('name'), str)
+}
+seen = set()
+
+def fail(index, message):
+    raise SystemExit(f'source_patches[{index}]: {message}')
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+for index, entry in enumerate(patches):
+    if not isinstance(entry, dict):
+        fail(index, 'entry must be an object')
+
+    source = entry.get('source')
+    if not isinstance(source, str) or source not in source_names:
+        fail(index, f'unknown source: {source!r}')
+    if source not in direct_sources:
+        fail(
+            index,
+            f'{source!r} is managed by musl-cross-make; use its embedded patch mechanism instead',
+        )
+
+    raw_path = entry.get('path')
+    if not isinstance(raw_path, str) or not raw_path or '\x00' in raw_path:
+        fail(index, 'path must be a non-empty string')
+    patch_path = pathlib.PurePosixPath(raw_path)
+    if (
+        patch_path.is_absolute()
+        or not patch_path.parts
+        or len(patch_path.parts) < 2
+        or patch_path.parts[0] != 'patches'
+        or raw_path != patch_path.as_posix()
+        or any(part in ('.', '..') for part in patch_path.parts)
+    ):
+        fail(index, 'path must be a canonical relative path below patches/')
+    absolute_path = root.joinpath(*patch_path.parts)
+    try:
+        absolute_path.resolve().relative_to(root)
+    except ValueError:
+        fail(index, 'path resolves outside the SDK source tree')
+    if absolute_path.is_symlink() or not absolute_path.is_file():
+        fail(index, f'patch file is not a regular non-symlink file: {raw_path}')
+
+    expected = entry.get('sha256')
+    if not isinstance(expected, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', expected):
+        fail(index, 'sha256 must be a 64-character hexadecimal digest')
+    actual = digest(absolute_path)
+    if actual != expected.lower():
+        fail(index, f'sha256 mismatch for {raw_path}: expected {expected.lower()}, got {actual}')
+
+    strip = entry.get('strip', 1)
+    if type(strip) is not int or not 0 <= strip <= 99:
+        fail(index, 'strip must be an integer from 0 through 99')
+
+    identity = (source, str(absolute_path.resolve()))
+    if identity in seen:
+        fail(index, f'duplicate patch for {source!r}: {raw_path}')
+    seen.add(identity)
+PY
+}
+
+source_patch_records() {
+  local source=$1
+  python3 - "$LOCK_FILE" "$source" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding='utf-8'))
+output = sys.stdout.buffer
+for entry in data.get('source_patches', []):
+    if entry['source'] == sys.argv[2]:
+        output.write(str(entry.get('strip', 1)).encode('ascii'))
+        output.write(b'\0')
+        output.write(entry['path'].encode('utf-8'))
+        output.write(b'\0')
+PY
+}
+
+apply_source_patches() {
+  local source=$1 source_root=$2 strip patch_path patch_file
+  [[ -d "$source_root" ]] || die "cannot apply patches to a missing source tree: $source_root"
+
+  while IFS= read -r -d '' strip && IFS= read -r -d '' patch_path; do
+    patch_file="$PATCH_ROOT/${patch_path#patches/}"
+    log "applying source patch for $source: $patch_path (-p$strip)"
+    patch --force --fuzz=0 --no-backup-if-mismatch \
+      --directory="$source_root" "-p$strip" --input="$patch_file"
+  done < <(source_patch_records "$source")
+}
+
+unpack_source() {
+  local source=$1 workspace=$2 destination=$3 source_file_name archive extract_root entry
+  local -a extracted_roots=()
+
+  source_file_name=$(source_file "$source")
+  [[ "$source_file_name" != */* && "$source_file_name" != . && "$source_file_name" != .. ]] || \
+    die "source file for $source is not a plain file name: $source_file_name"
+  archive="$CACHE_ROOT/sources/$source_file_name"
+  [[ -f "$archive" ]] || die "verified source archive is missing for $source: $archive"
+
+  mkdir -p "$workspace"
+  extract_root=$(mktemp -d "$workspace/.extract-$source.XXXXXX")
+  tar -xf "$archive" -C "$extract_root"
+  while IFS= read -r -d '' entry; do
+    extracted_roots+=("$entry")
+  done < <(find "$extract_root" -mindepth 1 -maxdepth 1 -print0)
+  if (( ${#extracted_roots[@]} != 1 )) || [[ ! -d "${extracted_roots[0]:-}" ]]; then
+    rm -rf -- "$extract_root"
+    die "source archive for $source must unpack to exactly one top-level directory: $archive"
+  fi
+
+  rm -rf -- "$destination"
+  mv -- "${extracted_roots[0]}" "$destination"
+  rmdir "$extract_root"
+  apply_source_patches "$source" "$destination"
 }
 
 load_lock() {
@@ -118,6 +281,7 @@ data = json.load(open(sys.argv[1], encoding='utf-8'))
 print(data['patches'][0]['sha256'])
 PY
 )
+  validate_source_patches
   export SOURCE_DATE_EPOCH TZ=UTC LC_ALL=C
   export PYTHONHASHSEED=0
 }
@@ -686,9 +850,7 @@ build_openssl() {
   config=$(openssl_target_for "$target")
   openssl_version=$(source_version openssl)
 
-  rm -rf -- "$source_root"
-  tar -xzf "$CACHE_ROOT/sources/openssl-$openssl_version.tar.gz" -C "$workspace"
-  mv "$workspace/openssl-$openssl_version" "$source_root"
+  unpack_source openssl "$workspace" "$source_root"
 
   local -a options=(no-apps no-asm no-dso no-module no-shared no-tests no-zlib)
   # SW64 intentionally stays on OpenSSL's generic C/no-asm implementation.
@@ -723,15 +885,12 @@ build_pciutils() {
   local workspace=$1 sdk_root=$2 target=$3
   local sysroot="$sdk_root/$target/$target"
   local source_root="$workspace/pciutils-$target"
-  local pciutils_version pci_host
-  pciutils_version=$(source_version pciutils)
+  local pci_host
   # pciutils wants CPU-OS here, not the complete GNU-style target triplet.
   # Supplying x86_64-linux-musl would make it treat "musl" as the OS.
   pci_host=${target%-musl}
 
-  rm -rf -- "$source_root"
-  tar -xJf "$CACHE_ROOT/sources/pciutils-$pciutils_version.tar.xz" -C "$workspace"
-  mv "$workspace/pciutils-$pciutils_version" "$source_root"
+  unpack_source pciutils "$workspace" "$source_root"
 
   # Explicitly disable every optional backend that would pull a target-side
   # runtime dependency into libpci.  Zlib is therefore not a dependency of
@@ -763,15 +922,13 @@ build_pciutils() {
 
 build_pkgconf() {
   local workspace=$1 output_root=$2 stage_one=$3
-  local pkgconf_version source_root install_root cc
-  pkgconf_version=$(source_version pkgconf)
+  local source_root install_root cc
   source_root="$workspace/pkgconf-host-build"
   install_root="$workspace/pkgconf-install"
   cc="$stage_one/bin/x86_64-linux-musl-gcc"
 
-  rm -rf -- "$source_root" "$install_root"
-  tar -xJf "$CACHE_ROOT/sources/pkgconf-$pkgconf_version.tar.xz" -C "$workspace"
-  mv "$workspace/pkgconf-$pkgconf_version" "$source_root"
+  rm -rf -- "$install_root"
+  unpack_source pkgconf "$workspace" "$source_root"
 
   log 'building static host-side pkgconf'
   (

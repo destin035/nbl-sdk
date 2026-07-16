@@ -110,7 +110,10 @@ link still succeeds.
 
 [`source-lock.json`](source-lock.json) is machine readable and locks the
 container base digest, `musl-cross-make` commit and embedded patchset, every
-source URL/version/SHA-256, and the archive timestamp.
+source URL/version/SHA-256, registered generic source patches, and the archive
+timestamp. Generic patches for directly built components are documented in
+[`patches/README.md`](patches/README.md). `musl-cross-make` and its managed
+toolchain inputs continue to use the submodule's existing patch mechanism.
 
 The SW64 target uses the existing submodule preset, including its SW8A CPU
 constraint. The builder adds no `-march=native`, host tuning, external RPM,

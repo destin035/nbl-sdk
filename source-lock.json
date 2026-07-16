@@ -20,6 +20,7 @@
       "sha256": "e42393d6ce94579d77395e16d722092a45aa590306031f6b47208ab11e1107a9"
     }
   ],
+  "source_patches": [],
   "sources": [
     {
       "name": "binutils-common",
