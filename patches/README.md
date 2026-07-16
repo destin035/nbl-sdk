@@ -21,8 +21,8 @@ and before that component is configured or compiled:
 root and must stay below `patches/`; `sha256` is required; and `strip` is
 optional (it defaults to `1`). Patch files must be regular files, not
 symlinks. The current directly built components are `ncurses`, `openssl`,
-`pciutils`, and `pkgconf`. Adding another directly built component should
-reuse the builder's `unpack_source` helper and add its source name to
+`pciutils`, `pkgconf`, and `readline`. Adding another directly built component
+should reuse the builder's `unpack_source` helper and add its source name to
 `DIRECT_PATCH_SOURCES`.
 
 Patch hashes are checked before a build uses its checkpoints. Since the lock

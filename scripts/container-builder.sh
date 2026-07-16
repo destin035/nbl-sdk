@@ -26,6 +26,7 @@ readonly -a DIRECT_PATCH_SOURCES=(
   openssl
   pciutils
   pkgconf
+  readline
 )
 
 WORK_DIR=
@@ -977,6 +978,51 @@ build_ncurses() {
   fi
 }
 
+build_readline() {
+  local workspace=$1 toolchain_root=$2 target=$3 install_root=$4
+  local source_root="$workspace/readline-$target"
+  local readline_version
+  readline_version=$(source_version readline)
+
+  rm -rf -- "$install_root"
+  mkdir -p "$install_root"
+  unpack_source readline "$workspace" "$source_root"
+
+  # Readline is linked only as a static archive.  Its generated readline.pc
+  # records tinfo as a private requirement, which makes the SDK's pkg-config
+  # wrapper supply the terminal capability library to static consumers.
+  log "building static GNU Readline $readline_version for $target"
+  (
+    cd "$source_root"
+    export PATH="$toolchain_root/bin:$PATH"
+    env \
+      AR="$target-ar" \
+      CC="$target-gcc" \
+      RANLIB="$target-ranlib" \
+      ./configure \
+        --host="$target" \
+        --prefix=/ \
+        --libdir=/lib \
+        --includedir=/include \
+        --disable-install-examples \
+        --disable-shared \
+        --enable-static \
+        --with-curses
+    make "-j$JOBS"
+    make "DESTDIR=$install_root" install-static
+  )
+
+  [[ -f "$install_root/include/readline/readline.h" ]] || die "Readline headers missing for $target"
+  [[ -f "$install_root/include/readline/history.h" ]] || die "History headers missing for $target"
+  [[ -f "$install_root/lib/libreadline.a" ]] || die "libreadline.a missing for $target"
+  [[ -f "$install_root/lib/libhistory.a" ]] || die "libhistory.a missing for $target"
+  [[ -f "$install_root/lib/pkgconfig/readline.pc" ]] || die "readline.pc missing for $target"
+  [[ -f "$install_root/lib/pkgconfig/history.pc" ]] || die "history.pc missing for $target"
+  if find "$install_root/lib" -maxdepth 1 -type f \( -name 'libreadline.so*' -o -name 'libhistory.so*' \) -print -quit | grep -q .; then
+    die "Readline installed a shared library for $target"
+  fi
+}
+
 build_pkgconf() {
   local workspace=$1 output_root=$2 stage_one=$3
   local source_root install_root cc
@@ -1091,6 +1137,16 @@ cached_ncurses_overlay_is_valid() {
     [[ -f "$directory/lib/pkgconfig/ncurses.pc" ]]
 }
 
+cached_readline_overlay_is_valid() {
+  local directory=$1
+  [[ -f "$directory/include/readline/readline.h" ]] &&
+    [[ -f "$directory/include/readline/history.h" ]] &&
+    [[ -f "$directory/lib/libreadline.a" ]] &&
+    [[ -f "$directory/lib/libhistory.a" ]] &&
+    [[ -f "$directory/lib/pkgconfig/readline.pc" ]] &&
+    [[ -f "$directory/lib/pkgconfig/history.pc" ]]
+}
+
 build_final_toolchain_once() {
   local work_mcm=$1 target=$2 output=$3 stage_one=$4 preset
   preset=$(preset_for_target "$target")
@@ -1195,6 +1251,16 @@ capture_ncurses_overlay() {
   cp -a "$install_root/lib" "$overlay/"
 }
 
+capture_readline_overlay() {
+  local install_root=$1 overlay=$2
+  mkdir -p "$overlay/include" "$overlay/lib/pkgconfig"
+  cp -a "$install_root/include/readline" "$overlay/include/"
+  cp -a "$install_root/lib/libreadline.a" "$install_root/lib/libhistory.a" "$overlay/lib/"
+  cp -a "$install_root/lib/pkgconfig/readline.pc" \
+    "$install_root/lib/pkgconfig/history.pc" \
+    "$overlay/lib/pkgconfig/"
+}
+
 build_openssl_overlay_once() {
   local target=$1 overlay=$2 scratch
   local sysroot
@@ -1231,6 +1297,23 @@ build_ncurses_overlay_once() {
   build_ncurses "$scratch/work" "$scratch/$target" "$target" "$install_root"
   capture_ncurses_overlay "$install_root" "$overlay"
   cached_ncurses_overlay_is_valid "$overlay" || die "ncurses checkpoint is incomplete for $target"
+}
+
+build_readline_overlay_once() {
+  local target=$1 overlay=$2 scratch install_root sysroot
+  scratch="$WORK_DIR/readline-$target-sdk"
+  install_root="$scratch/install"
+  rm -rf -- "$scratch" "$overlay"
+  mkdir -p "$scratch/work" "$overlay"
+  cp -a "$CHECKPOINT_ROOT/toolchains/$target" "$scratch/$target"
+  sysroot="$scratch/$target/$target"
+  # Readline's configure test links tgetent against the target sysroot.  Layer
+  # the completed ncurses overlay first so it detects libtinfo, never a host
+  # terminal library.
+  cp -a "$CHECKPOINT_ROOT/integrations/$target/ncurses/." "$sysroot/"
+  build_readline "$scratch/work" "$scratch/$target" "$target" "$install_root"
+  capture_readline_overlay "$install_root" "$overlay"
+  cached_readline_overlay_is_valid "$overlay" || die "Readline checkpoint is incomplete for $target"
 }
 
 ensure_openssl_checkpoint() {
@@ -1287,6 +1370,25 @@ ensure_ncurses_checkpoint() {
   commit_checkpoint_dir "$temporary" "$destination"
 }
 
+ensure_readline_checkpoint() {
+  local target=$1 destination
+  destination="$CHECKPOINT_ROOT/integrations/$target/readline"
+  if cached_readline_overlay_is_valid "$destination"; then
+    log "checkpoint reuse: Readline $target"
+    return
+  fi
+
+  ensure_toolchain_checkpoint "$target"
+  ensure_ncurses_checkpoint "$target"
+  ensure_work_dir
+  local temporary="$CHECKPOINT_ROOT/.tmp/readline-$target.$$"
+  rm -rf -- "$temporary"
+  mkdir -p "$temporary"
+  run_step "libraries/$target/readline" build_readline_overlay_once "$target" "$temporary"
+  mkdir -p "$(dirname -- "$destination")"
+  commit_checkpoint_dir "$temporary" "$destination"
+}
+
 build_toolchain_stage() {
   local target
   for target in "${TARGETS[@]}"; do
@@ -1303,6 +1405,7 @@ build_library_stage() {
     ensure_openssl_checkpoint "$target"
     ensure_pciutils_checkpoint "$target"
     ensure_ncurses_checkpoint "$target"
+    ensure_readline_checkpoint "$target"
   done
 }
 
@@ -1317,6 +1420,7 @@ ensure_all_checkpoints() {
     ensure_openssl_checkpoint "$target"
     ensure_pciutils_checkpoint "$target"
     ensure_ncurses_checkpoint "$target"
+    ensure_readline_checkpoint "$target"
   done
   TARGET_FILTER=$saved_filter
 }
@@ -1333,6 +1437,8 @@ cached_sdk_is_valid() {
     [[ -f "$sysroot/lib/libcrypto.a" ]] || return 1
     [[ -f "$sysroot/lib/libpci.a" ]] || return 1
     [[ -f "$sysroot/lib/libncurses.a" ]] || return 1
+    [[ -f "$sysroot/lib/libreadline.a" ]] || return 1
+    [[ -f "$sysroot/lib/libhistory.a" ]] || return 1
   done
   return 0
 }
@@ -1348,6 +1454,7 @@ build_assembled_sdk_once() {
     cp -a "$CHECKPOINT_ROOT/integrations/$target/openssl/." "$sysroot/"
     cp -a "$CHECKPOINT_ROOT/integrations/$target/pciutils/." "$sysroot/"
     cp -a "$CHECKPOINT_ROOT/integrations/$target/ncurses/." "$sysroot/"
+    cp -a "$CHECKPOINT_ROOT/integrations/$target/readline/." "$sysroot/"
     install_toolchain_pkgconf "$CHECKPOINT_ROOT/host/pkgconf" "$temporary/$target"
     write_pkg_config_wrapper "$temporary" "$target"
   done
@@ -1391,12 +1498,18 @@ check_required_toolchain_layout() {
   [[ -f "$sysroot/lib/libpci.a" ]] || die "missing libpci.a for $target"
   [[ -f "$sysroot/lib/libncurses.a" ]] || die "missing libncurses.a for $target"
   [[ -f "$sysroot/lib/libtinfo.a" ]] || die "missing libtinfo.a for $target"
+  [[ -f "$sysroot/lib/libreadline.a" ]] || die "missing libreadline.a for $target"
+  [[ -f "$sysroot/lib/libhistory.a" ]] || die "missing libhistory.a for $target"
   [[ -f "$sysroot/include/openssl/evp.h" ]] || die "missing OpenSSL headers for $target"
   [[ -f "$sysroot/include/pci/pci.h" ]] || die "missing pciutils headers for $target"
   [[ -f "$sysroot/include/ncurses.h" ]] || die "missing ncurses headers for $target"
+  [[ -f "$sysroot/include/readline/readline.h" ]] || die "missing Readline headers for $target"
+  [[ -f "$sysroot/include/readline/history.h" ]] || die "missing History headers for $target"
   [[ -f "$sysroot/lib/pkgconfig/openssl.pc" ]] || die "missing openssl.pc for $target"
   [[ -f "$sysroot/lib/pkgconfig/libpci.pc" ]] || die "missing libpci.pc for $target"
   [[ -f "$sysroot/lib/pkgconfig/ncurses.pc" ]] || die "missing ncurses.pc for $target"
+  [[ -f "$sysroot/lib/pkgconfig/readline.pc" ]] || die "missing readline.pc for $target"
+  [[ -f "$sysroot/lib/pkgconfig/history.pc" ]] || die "missing history.pc for $target"
 }
 
 check_required_layout() {
@@ -1464,11 +1577,21 @@ write_validation_sources() {
     '#include <ncurses.h>' \
     'int main(void) { return initscr() == 0; }' \
     >"$directory/ncurses.c"
+  printf '%s\n' \
+    '#include <stdio.h>' \
+    '#include <readline/readline.h>' \
+    'int main(void) { rl_initialize(); return rl_readline_version == 0; }' \
+    >"$directory/readline.c"
+  printf '%s\n' \
+    '#include <stdio.h>' \
+    '#include <readline/history.h>' \
+    'int main(void) { using_history(); return 0; }' \
+    >"$directory/history.c"
 }
 
 validate_toolchain_compilation() {
   local toolchain_root=$1 target=$2 validation_root=$3 label=$4
-  local cc cxx pkg readelf_tool openssl_flags pci_flags ncurses_flags
+  local cc cxx pkg readelf_tool openssl_flags pci_flags ncurses_flags readline_flags history_flags
   log "validating toolchain compilation ($label): $toolchain_root"
   rm -rf -- "$validation_root"
   mkdir -p "$validation_root"
@@ -1484,10 +1607,14 @@ validate_toolchain_compilation() {
   openssl_flags=$("$pkg" --cflags --libs openssl)
   pci_flags=$("$pkg" --cflags --libs libpci)
   ncurses_flags=$("$pkg" --cflags --libs ncurses)
+  readline_flags=$("$pkg" --cflags --libs readline)
+  history_flags=$("$pkg" --cflags --libs history)
   [[ "$openssl_flags" == *-lssl* && "$openssl_flags" == *-lcrypto* ]] || die "OpenSSL pkg-config flags are incomplete for $target: $openssl_flags"
   [[ "$pci_flags" == *-lpci* ]] || die "libpci pkg-config flags are incomplete for $target: $pci_flags"
   [[ "$ncurses_flags" == *-lncurses* && "$ncurses_flags" == *-ltinfo* ]] || die "ncurses pkg-config flags are incomplete for $target: $ncurses_flags"
-  [[ "$openssl_flags" != *"/usr/include"* && "$pci_flags" != *"/usr/include"* && "$ncurses_flags" != *"/usr/include"* ]] || die "pkg-config leaked host include paths for $target"
+  [[ "$readline_flags" == *-lreadline* && "$readline_flags" == *-ltinfo* ]] || die "Readline pkg-config flags are incomplete for $target: $readline_flags"
+  [[ "$history_flags" == *-lhistory* ]] || die "History pkg-config flags are incomplete for $target: $history_flags"
+  [[ "$openssl_flags" != *"/usr/include"* && "$pci_flags" != *"/usr/include"* && "$ncurses_flags" != *"/usr/include"* && "$readline_flags" != *"/usr/include"* && "$history_flags" != *"/usr/include"* ]] || die "pkg-config leaked host include paths for $target"
 
   # The .pc files are generated by this SDK and use paths without spaces.
   # Deliberate word splitting converts pkgconf's flags into compiler args.
@@ -1497,12 +1624,18 @@ validate_toolchain_compilation() {
   "$cc" -static "$validation_root/pci.c" -o "$validation_root/pci" $pci_flags
   # shellcheck disable=SC2086
   "$cc" -static "$validation_root/ncurses.c" -o "$validation_root/ncurses" $ncurses_flags
+  # shellcheck disable=SC2086
+  "$cc" -static "$validation_root/readline.c" -o "$validation_root/readline" $readline_flags
+  # shellcheck disable=SC2086
+  "$cc" -static "$validation_root/history.c" -o "$validation_root/history" $history_flags
 
   verify_target_elf "$target" "$validation_root/hello-c" "$readelf_tool"
   verify_target_elf "$target" "$validation_root/hello-cxx" "$readelf_tool"
   verify_target_elf "$target" "$validation_root/openssl" "$readelf_tool"
   verify_target_elf "$target" "$validation_root/pci" "$readelf_tool"
   verify_target_elf "$target" "$validation_root/ncurses" "$readelf_tool"
+  verify_target_elf "$target" "$validation_root/readline" "$readelf_tool"
+  verify_target_elf "$target" "$validation_root/history" "$readelf_tool"
 }
 
 validate_standalone_toolchain() {
@@ -1619,11 +1752,13 @@ materialize_selected_sdk() {
     ensure_openssl_checkpoint "$target"
     ensure_pciutils_checkpoint "$target"
     ensure_ncurses_checkpoint "$target"
+    ensure_readline_checkpoint "$target"
     cp -a "$CHECKPOINT_ROOT/toolchains/$target" "$destination/$target"
     sysroot="$destination/$target/$target"
     cp -a "$CHECKPOINT_ROOT/integrations/$target/openssl/." "$sysroot/"
     cp -a "$CHECKPOINT_ROOT/integrations/$target/pciutils/." "$sysroot/"
     cp -a "$CHECKPOINT_ROOT/integrations/$target/ncurses/." "$sysroot/"
+    cp -a "$CHECKPOINT_ROOT/integrations/$target/readline/." "$sysroot/"
     install_toolchain_pkgconf "$CHECKPOINT_ROOT/host/pkgconf" "$destination/$target"
     write_pkg_config_wrapper "$destination" "$target"
   done
@@ -1732,6 +1867,11 @@ checkpoint_status() {
       printf 'ncurses[%s]=ready\n' "$target"
     else
       printf 'ncurses[%s]=missing\n' "$target"
+    fi
+    if cached_readline_overlay_is_valid "$CHECKPOINT_ROOT/integrations/$target/readline"; then
+      printf 'readline[%s]=ready\n' "$target"
+    else
+      printf 'readline[%s]=missing\n' "$target"
     fi
   done
   sdk_root="$CHECKPOINT_ROOT/sdk/nbl-sdk-$SDK_VERSION"

@@ -32,6 +32,18 @@
       "path": "patches/ncurses/6.5/0001-config-recognize-sw_64-linux.patch",
       "sha256": "97c73f9bad7ea717a47e2a3fb7e518dc85fa1796c625591a4006b6faf01d7764",
       "strip": 1
+    },
+    {
+      "source": "readline",
+      "path": "patches/readline/8.3/0001-upstream-8.3-maintenance.patch",
+      "sha256": "f224a576fcb5ad766a98b91598f81324005d8659b1f1285273e2bbb5619c3938",
+      "strip": 1
+    },
+    {
+      "source": "readline",
+      "path": "patches/readline/8.3/0002-config-recognize-sw_64-linux.patch",
+      "sha256": "d35d2572dd6ac707c9e96195b02c5f50080dddab429712b9568efa9ef7e85d6f",
+      "strip": 1
     }
   ],
   "sources": [
@@ -162,6 +174,16 @@
         "https://distfiles.ariadne.space/pkgconf/pkgconf-2.3.0.tar.xz"
       ],
       "sha256": "3a9080ac51d03615e7c1910a0a2a8df08424892b5f13b0628a204d3fcce0ea8b"
+    },
+    {
+      "name": "readline",
+      "file": "readline-8.3.tar.gz",
+      "version": "8.3",
+      "urls": [
+        "https://ftpmirror.gnu.org/gnu/readline/readline-8.3.tar.gz",
+        "https://ftp.gnu.org/gnu/readline/readline-8.3.tar.gz"
+      ],
+      "sha256": "fe5383204467828cd495ee8d1d3c037a7eba1389c22bc6a041f627976f9061cc"
     }
   ]
 }

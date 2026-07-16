@@ -1,0 +1,23 @@
+From: nbl-sdk <noreply@example.invalid>
+Subject: [PATCH] config: recognize SW64 Linux targets
+
+Teach GNU Readline's bundled config.sub about the SW64 CPU name so its
+configure script accepts the SDK's sw_64-linux-musl target.
+
+---
+ support/config.sub | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/support/config.sub b/support/config.sub
+--- a/support/config.sub
++++ b/support/config.sub
+@@ -1429,6 +1429,7 @@ case $cpu in
+ 			| sparcv9b \
+ 			| sparcv9v \
+ 			| spu \
++			| sw_64 \
+ 			| sv1 \
+ 			| sx* \
+ 			| tahoe \
+-- 
+2.47.3
